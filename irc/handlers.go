@@ -1259,14 +1259,14 @@ func infoHandler(server *Server, client *Client, msg ircmsg.Message, rb *Respons
 	for _, line := range infoString1 {
 		rb.Add(nil, server.name, RPL_INFO, nick, line)
 	}
-	rb.Add(nil, server.name, RPL_INFO, nick, fmt.Sprintf(client.t("This is Ergo version %s."), SemVer))
+	rb.Add(nil, server.name, RPL_INFO, nick, fmt.Sprintf(client.t("This is Redbrick version %s."), SemVer))
 	if Commit != "" {
 		rb.Add(nil, server.name, RPL_INFO, nick, fmt.Sprintf(client.t("It was built from git hash %s."), Commit))
 	}
 	rb.Add(nil, server.name, RPL_INFO, nick, fmt.Sprintf(client.t("It was compiled using %s."), runtime.Version()))
 	rb.Add(nil, server.name, RPL_INFO, nick, fmt.Sprintf(client.t("This server has been running since %s."), server.ctime.Format(time.RFC1123)))
 	rb.Add(nil, server.name, RPL_INFO, nick, "")
-	rb.Add(nil, server.name, RPL_INFO, nick, client.t("Ergo is released under the MIT license."))
+	rb.Add(nil, server.name, RPL_INFO, nick, client.t("Redbrick is released under the MIT license."))
 	rb.Add(nil, server.name, RPL_INFO, nick, "")
 	rb.Add(nil, server.name, RPL_INFO, nick, client.t("Core Developers:"))
 	for _, line := range infoString2 {
@@ -2132,6 +2132,12 @@ func monitorStatusHandler(server *Server, client *Client, msg ircmsg.Message, rb
 // MOTD
 func motdHandler(server *Server, client *Client, msg ircmsg.Message, rb *ResponseBuffer) bool {
 	server.MOTD(client, rb)
+	return false
+}
+
+// RULES
+func rulesHandler(server *Server, client *Client, msg ircmsg.Message, rb *ResponseBuffer) bool {
+	server.RULES(client, rb)
 	return false
 }
 

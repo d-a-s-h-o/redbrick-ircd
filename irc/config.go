@@ -550,6 +550,20 @@ type TorListenersConfig struct {
 	MaxConnectionsPerDuration int           `yaml:"max-connections-per-duration"`
 }
 
+// BridgeConfig configures the PHP chat bridge
+type BridgeConfig struct {
+	Enabled          bool
+	ListenAddress    string   `yaml:"listen-address"`
+	AuthKey          string   `yaml:"auth-key"`
+	AllowedIPs       []string `yaml:"allowed-ips"`
+	allowedIPNets    []net.IPNet
+	ConnectionLimit  int              `yaml:"connection-limit"`
+	RequestRateLimit int              `yaml:"request-rate-limit"`
+	LinkTokenExpiry  custime.Duration `yaml:"link-token-expiry"`
+	linkTokenExpiry  time.Duration
+	DefaultMappings  map[string]string `yaml:"default-mappings"`
+}
+
 // Config defines the overall configuration.
 type Config struct {
 	AllowEnvironmentOverrides bool `yaml:"allow-environment-overrides"`
@@ -581,6 +595,11 @@ type Config struct {
 		MOTD                    string
 		motdLines               []string
 		MOTDFormatting          bool   `yaml:"motd-formatting"`
+		ShortMOTD               string `yaml:"short-motd"`
+		shortMotdLines          []string
+		Rules                   string `yaml:"rules"`
+		rulesLines              []string
+		RulesFormatting         bool   `yaml:"rules-formatting"`
 		InitialNotice           string `yaml:"initial-notice"`
 		IdleTimeouts            struct {
 			Registration time.Duration
@@ -632,6 +651,8 @@ type Config struct {
 		BearerTokens     []string `yaml:"bearer-tokens"`
 		bearerTokenBytes [][]byte
 	} `yaml:"api"`
+
+	Bridge BridgeConfig
 
 	Roleplay struct {
 		Enabled        bool
@@ -1480,6 +1501,34 @@ func LoadConfig(filename string) (config *Config, err error) {
 		return nil, fmt.Errorf("Could not parse secure-nets: %v\n", err.Error())
 	}
 
+	// Bridge configuration postprocessing
+	if config.Bridge.Enabled {
+		if config.Bridge.AuthKey == "" {
+			return nil, fmt.Errorf("bridge is enabled but no auth-key is configured")
+		}
+		if config.Bridge.ListenAddress == "" {
+			return nil, fmt.Errorf("bridge is enabled but no listen-address is configured")
+		}
+		// Parse allowed IPs
+		config.Bridge.allowedIPNets, err = utils.ParseNetList(config.Bridge.AllowedIPs)
+		if err != nil {
+			return nil, fmt.Errorf("Could not parse bridge allowed-ips: %v", err.Error())
+		}
+		// Parse link token expiry
+		if config.Bridge.LinkTokenExpiry == 0 {
+			config.Bridge.linkTokenExpiry = 10 * time.Minute // default
+		} else {
+			config.Bridge.linkTokenExpiry = time.Duration(config.Bridge.LinkTokenExpiry)
+		}
+		// Set defaults
+		if config.Bridge.ConnectionLimit == 0 {
+			config.Bridge.ConnectionLimit = 10
+		}
+		if config.Bridge.RequestRateLimit == 0 {
+			config.Bridge.RequestRateLimit = 100
+		}
+	}
+
 	rawRegexp := config.Accounts.VHosts.ValidRegexpRaw
 	if rawRegexp != "" {
 		regexp, err := regexp.Compile(rawRegexp)
@@ -1614,6 +1663,8 @@ func LoadConfig(filename string) (config *Config, err error) {
 	config.Server.Compatibility.allowTruncation = utils.BoolDefaultTrue(config.Server.Compatibility.AllowTruncation)
 
 	config.loadMOTD()
+	config.loadShortMOTD()
+	config.loadRULES()
 
 	// in the current implementation, we disable history by creating a history buffer
 	// with zero capacity. but the `enabled` config option MUST be respected regardless
@@ -1959,6 +2010,74 @@ func (config *Config) loadMOTD() error {
 			// "- " is the required prefix for MOTD
 			lineToSend = fmt.Sprintf("- %s", lineToSend)
 			config.Server.motdLines = append(config.Server.motdLines, lineToSend)
+		}
+	}
+	return nil
+}
+
+func (config *Config) loadShortMOTD() error {
+	if config.Server.ShortMOTD != "" {
+		file, err := os.Open(config.Server.ShortMOTD)
+		if err != nil {
+			return err
+		}
+		defer file.Close()
+		contents, err := io.ReadAll(file)
+		if err != nil {
+			return err
+		}
+
+		lines := bytes.Split(contents, []byte{'\n'})
+		for i, line := range lines {
+			lineToSend := string(bytes.TrimRight(line, "\r\n"))
+			if len(lineToSend) == 0 && i == len(lines)-1 {
+				// if the last line of the Short MOTD was properly terminated with \n,
+				// there's no need to send a blank line to clients
+				continue
+			}
+			if config.Server.MOTDFormatting {
+				lineToSend = ircfmt.Unescape(lineToSend)
+			}
+			if config.Server.EnforceUtf8 && !utf8.ValidString(lineToSend) {
+				return fmt.Errorf("Line %d of Short MOTD contains invalid UTF8", i+1)
+			}
+			// "- " is the required prefix for MOTD
+			lineToSend = fmt.Sprintf("- %s", lineToSend)
+			config.Server.shortMotdLines = append(config.Server.shortMotdLines, lineToSend)
+		}
+	}
+	return nil
+}
+
+func (config *Config) loadRULES() error {
+	if config.Server.Rules != "" {
+		file, err := os.Open(config.Server.Rules)
+		if err != nil {
+			return err
+		}
+		defer file.Close()
+		contents, err := io.ReadAll(file)
+		if err != nil {
+			return err
+		}
+
+		lines := bytes.Split(contents, []byte{'\n'})
+		for i, line := range lines {
+			lineToSend := string(bytes.TrimRight(line, "\r\n"))
+			if len(lineToSend) == 0 && i == len(lines)-1 {
+				// if the last line of the RULES was properly terminated with \n,
+				// there's no need to send a blank line to clients
+				continue
+			}
+			if config.Server.RulesFormatting {
+				lineToSend = ircfmt.Unescape(lineToSend)
+			}
+			if config.Server.EnforceUtf8 && !utf8.ValidString(lineToSend) {
+				return fmt.Errorf("Line %d of RULES contains invalid UTF8", i+1)
+			}
+			// "- " is the required prefix for RULES
+			lineToSend = fmt.Sprintf("- %s", lineToSend)
+			config.Server.rulesLines = append(config.Server.rulesLines, lineToSend)
 		}
 	}
 	return nil

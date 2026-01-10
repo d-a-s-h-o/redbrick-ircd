@@ -528,6 +528,11 @@ Registers an account in accordance with the draft/account-registration capabilit
 
 Reloads the config file and updates TLS certificates on listeners`,
 	},
+	"rules": {
+		text: `RULES [server]
+
+Returns the server rules for this, or the given, server.`,
+	},
 	"time": {
 		text: `TIME [server]
 

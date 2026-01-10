@@ -103,6 +103,21 @@ will not be able to use it.`,
 			enabled:      servCmdRequiresNickRes,
 			authRequired: true,
 		},
+		"link": {
+			handler: nsLinkHandler,
+			help: `Syntax: $bLINK <token>$b
+
+LINK completes the PHP chat account linking process. After initiating a link
+from the PHP chat interface, you will receive a token. Use this command with
+that token to complete the linking. You must be identified to an IRC account
+to use this command.`,
+			helpShort: `$bLINK$b links your IRC account to a PHP chat account.`,
+			enabled: func(config *Config) bool {
+				return config.Bridge.Enabled
+			},
+			authRequired: true,
+			minParams:    1,
+		},
 		"identify": {
 			handler: nsIdentifyHandler,
 			help: `Syntax: $bIDENTIFY <username> [password]$b
@@ -818,6 +833,47 @@ func nsGroupHandler(service *ircService, server *Server, client *Client, command
 	} else {
 		service.Notice(rb, client.t("Error reserving nickname"))
 	}
+}
+
+func nsLinkHandler(service *ircService, server *Server, client *Client, command string, params []string, rb *ResponseBuffer) {
+	// Check if bridge is enabled
+	if server.bridge == nil || !server.bridge.IsEnabled() {
+		service.Notice(rb, client.t("Bridge is not enabled on this server"))
+		return
+	}
+
+	// Get the token from params
+	token := params[0]
+
+	// Get the user's account
+	account := client.Account()
+	if account == "" {
+		service.Notice(rb, client.t("You must be identified to an account to use this command"))
+		return
+	}
+
+	// Validate the token
+	linkToken, err := server.bridge.ValidateLinkToken(token, account)
+	if err != nil {
+		service.Notice(rb, fmt.Sprintf(client.t("Invalid or expired token: %s"), err.Error()))
+		return
+	}
+
+	// Complete the linking
+	err = server.bridge.CompleteLinking(linkToken.PHPUserID, account)
+	if err != nil {
+		service.Notice(rb, fmt.Sprintf(client.t("Failed to complete linking: %s"), err.Error()))
+		return
+	}
+
+	// Mark token as complete
+	server.bridge.linkingManager.CompleteLink(token, true)
+
+	// Notify user
+	service.Notice(rb, client.t("Account successfully linked! Your IRC and PHP chat accounts are now connected."))
+
+	// Log the event
+	server.logger.Info("bridge", "Account linked via NickServ:", "irc_account", account, "token", token)
 }
 
 func nsLoginThrottleCheck(service *ircService, client *Client, rb *ResponseBuffer) (success bool) {

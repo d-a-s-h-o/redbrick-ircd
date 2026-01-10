@@ -48,18 +48,18 @@ server:
         # for details.
 
         # The standard SSL/TLS port for IRC is 6697. This will listen on all interfaces:
-        ":6697":
+        # ":6697":
             # this is a standard TLS configuration with a single certificate;
             # see the manual for instructions on how to configure SNI
-            tls:
-                cert: fullchain.pem
-                key: privkey.pem
+            #tls:
+            #    cert: fullchain.pem
+            #    key: privkey.pem
             # 'proxy' should typically be false. It's for cloud load balancers that
             # always send a PROXY protocol header ahead of the connection. See the
             # manual ("Reverse proxies") for more details.
-            proxy: false
+            #proxy: false
             # set the minimum TLS version:
-            min-tls-version: 1.2
+            #min-tls-version: 1.2
 
         # Example of a Unix domain socket for proxying:
         # "/tmp/ergo_sock":
@@ -174,15 +174,29 @@ server:
 
     # motd filename
     # if you change the motd, you should move it to ircd.motd
-    motd: ergo.motd
+    motd: ircd.motd
 
     # motd formatting codes
     # if this is true, the motd is escaped using formatting codes like $c, $b, and $i
     motd-formatting: true
 
+    # short-motd filename
+    # this is shown on connection; if empty, the regular motd is shown instead
+    # if you want a short motd on connection, create a file named irc.smotd
+    short-motd: ircd.smotd
+
+    # rules filename
+    # rules can be viewed with the /RULES command
+    # if you want to define server rules, create a file named irc.rules
+    rules: ircd.rules
+
+    # rules formatting codes
+    # if this is true, the rules are escaped using formatting codes like $c, $b, and $i
+    #rules-formatting: true
+
     # send a configurable notice to clients immediately after they connect,
     # as a way of detecting open proxies
-    #initial-notice: "*** Welcome to the Ergo IRC server"
+    initial-notice: "*** Welcome to the 404 IRC server"
 
     # idle timeouts for inactive clients
     idle-timeouts:
@@ -748,7 +762,7 @@ oper-classes:
 # ircd operators
 opers:
     # default operator named 'admin'; log in with /OPER admin <password>
-    admin:
+    dasho:
         # which capabilities this oper has access to
         class: "server-admin"
 
@@ -771,7 +785,7 @@ opers:
         # or by certificate fingerprint, or both. if a password hash is set, then a
         # password is required to oper up (e.g., /OPER dan mypassword). to generate
         # the hash, use `ergo genpasswd`.
-        password: "$2a$04$0123456789abcdef0123456789abcdef0123456789abcdef01234"
+        password: "$2a$04$19MwvLqHkpI1XD/j7qGfQ.cnitdi0MXpwtYQdLZTcvhTijDFOtMuO"
 
         # if a SHA-256 certificate fingerprint is configured here, then it will be
         # required to /OPER. if you comment out the password hash above, then you can
@@ -1159,3 +1173,52 @@ api:
     # python3 -c "import secrets; print(secrets.token_urlsafe(32))"
     bearer-tokens:
         - "example"
+
+# Bridge configuration for external chat application integration.
+# This enables a bidirectional bridge between Ergo IRC and external applications
+# (e.g., PHP web chat). The bridge allows users from both platforms to interact
+# seamlessly with synchronized messages, joins/parts, and account linking.
+bridge:
+    # is the bridge enabled?
+    enabled: true
+
+    # TCP listener address for bridge connections (NO TLS - internal use only).
+    # SECURITY: This should ONLY bind to localhost (127.0.0.1) unless you have
+    # a secured internal network. The bridge protocol uses HMAC authentication
+    # but transmits data in plaintext.
+    listen-address: "0.0.0.0:6666"
+
+    # Shared secret key for HMAC-SHA256 authentication. REQUIRED if bridge is enabled.
+    # Generate a strong random key with at least 32 characters:
+    # python3 -c "import secrets; print(secrets.token_urlsafe(32))"
+    # This key must be shared with the external application.
+    auth-key: ""
+
+    # Optional IP allowlist for bridge connections. Only IPs in this list can connect.
+    # Leave empty to allow connections from any IP (not recommended for production).
+    allowed-ips:
+        - "127.0.0.1"
+        - "::1"
+        - "0.0.0.0"
+
+    # Maximum number of concurrent bridge connections allowed.
+    connection-limit: 100
+
+    # Maximum number of requests per minute from all bridge connections combined.
+    # This helps prevent abuse and resource exhaustion.
+    request-rate-limit: 200
+
+    # How long account linking tokens remain valid before expiring.
+    # Users must complete the NickServ LINK command within this timeframe.
+    link-token-expiry: 10m
+
+    # Default bidirectional mappings between external rooms/destinations and IRC channels.
+    # Format: "external_destination": "#irc-channel"
+    # - For PHP web chat: "room" is main room, "s XX" are special rooms by status level
+    # - Users joining these external destinations will appear in the mapped IRC channels
+    # - IRC users joining these channels will appear in the external application
+    default-mappings:
+        "room": "#general"      # Main room → #general
+        "s 31": "#members"      # Members room → #members
+        "s 48": "#staff"        # Staff room → #staff
+        "s 56": "#admin"        # Admin room → #admin

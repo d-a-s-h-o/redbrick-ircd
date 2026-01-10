@@ -337,6 +337,10 @@ func init() {
 			minParams: 0,
 			capabs:    []string{"rehash"},
 		},
+		"RULES": {
+			handler:   rulesHandler,
+			minParams: 0,
+		},
 		"TIME": {
 			handler:   timeHandler,
 			minParams: 0,

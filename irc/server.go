@@ -104,6 +104,9 @@ type Server struct {
 	apiHandler  http.Handler // always initialized
 	apiListener *utils.ReloadableListener
 	apiServer   *http.Server // nil if API is not enabled
+
+	// Bridge
+	bridge *BridgeManager
 }
 
 // NewServer returns a new Oragono server.
@@ -131,6 +134,9 @@ func NewServer(config *Config, logger *logger.Manager) (*Server, error) {
 	server.snomasks.Initialize()
 
 	server.apiHandler = newAPIHandler(server)
+
+	// Initialize bridge
+	server.bridge = NewBridgeManager(server)
 
 	if err := server.applyConfig(config); err != nil {
 		return nil, err
@@ -509,7 +515,7 @@ func (server *Server) playRegistrationBurst(session *Session) {
 		reportPersistenceStatus(c, rb, false)
 	}
 	server.Lusers(c, rb)
-	server.MOTD(c, rb)
+	server.ShortMOTD(c, rb)
 	rb.Send(true)
 
 	modestring := c.ModeString()
@@ -581,6 +587,41 @@ func (server *Server) MOTD(client *Client, rb *ResponseBuffer) {
 		rb.Add(nil, server.name, RPL_MOTD, client.nick, line)
 	}
 	rb.Add(nil, server.name, RPL_ENDOFMOTD, client.nick, client.t("End of MOTD command"))
+}
+
+func (server *Server) ShortMOTD(client *Client, rb *ResponseBuffer) {
+	config := server.Config()
+	// Use shortMotdLines if available, otherwise fall back to motdLines
+	motdLines := config.Server.shortMotdLines
+	if len(motdLines) < 1 {
+		motdLines = config.Server.motdLines
+	}
+
+	if len(motdLines) < 1 {
+		rb.Add(nil, server.name, ERR_NOMOTD, client.nick, client.t("MOTD File is missing"))
+		return
+	}
+
+	rb.Add(nil, server.name, RPL_MOTDSTART, client.nick, fmt.Sprintf(client.t("- %s Message of the day - "), server.name))
+	for _, line := range motdLines {
+		rb.Add(nil, server.name, RPL_MOTD, client.nick, line)
+	}
+	rb.Add(nil, server.name, RPL_ENDOFMOTD, client.nick, client.t("End of MOTD command"))
+}
+
+func (server *Server) RULES(client *Client, rb *ResponseBuffer) {
+	rulesLines := server.Config().Server.rulesLines
+
+	if len(rulesLines) < 1 {
+		rb.Add(nil, server.name, ERR_NORULES, client.nick, client.t("RULES File is missing"))
+		return
+	}
+
+	rb.Add(nil, server.name, RPL_RULESTART, client.nick, fmt.Sprintf(client.t("- %s Server Rules - "), server.name))
+	for _, line := range rulesLines {
+		rb.Add(nil, server.name, RPL_RULES, client.nick, line)
+	}
+	rb.Add(nil, server.name, RPL_ENDOFRULES, client.nick, client.t("End of RULES command"))
 }
 
 func (server *Server) handleAutojoins(session *Session, channelNames []string) {
@@ -875,6 +916,8 @@ func (server *Server) applyConfig(config *Config) (err error) {
 
 	server.setupAPIListener(config)
 
+	server.setupBridge(config)
+
 	// set RPL_ISUPPORT
 	var newISupportReplies [][]string
 	if oldConfig != nil {
@@ -984,6 +1027,36 @@ func (server *Server) setupAPIListener(config *Config) {
 		}
 	}(server.apiServer, server.apiListener)
 	server.logger.Info("server", "Started API listener", server.apiServer.Addr)
+}
+
+func (server *Server) setupBridge(config *Config) {
+	// Stop existing bridge if config changed or disabled
+	if server.bridge != nil && server.bridge.IsEnabled() {
+		oldConfig := server.bridge.config.Load()
+		if oldConfig != nil && (!config.Bridge.Enabled || oldConfig.ListenAddress != config.Bridge.ListenAddress) {
+			server.logger.Info("bridge", "Stopping bridge")
+			server.bridge.Stop()
+		}
+	}
+
+	if !config.Bridge.Enabled {
+		return
+	}
+
+	// Initialize and start bridge
+	err := server.bridge.Initialize(&config.Bridge)
+	if err != nil {
+		server.logger.Error("bridge", "Failed to initialize bridge:", err.Error())
+		return
+	}
+
+	err = server.bridge.Start()
+	if err != nil {
+		server.logger.Error("bridge", "Failed to start bridge:", err.Error())
+		return
+	}
+
+	server.logger.Info("bridge", "Bridge started successfully")
 }
 
 func (server *Server) loadDatastore(config *Config) error {
