@@ -5,28 +5,27 @@ package irc
 
 import (
 	"bufio"
+	"encoding/json"
 	"fmt"
 	"net"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/ergochat/ergo/irc/connection_limits"
 	"github.com/ergochat/ergo/irc/utils"
 )
 
 // BridgeListener handles incoming connections from PHP
 type BridgeListener struct {
-	server      *Server
-	bridge      *BridgeManager
-	config      *BridgeConfig
-	listener    net.Listener
-	shutdown    atomic.Bool
-	activeConns atomic.Int32
-	rateLimiter *connection_limits.GenericThrottle
-	wg          sync.WaitGroup
+	server        *Server
+	bridge        *BridgeManager
+	config        *BridgeConfig
+	listener      net.Listener
+	shutdown      atomic.Bool
+	activeConns   atomic.Int32
+	rateLimiter   *utils.GenericThrottle
+	wg            sync.WaitGroup
 }
 
 // NewBridgeListener creates and starts a new bridge listener
@@ -49,10 +48,7 @@ func NewBridgeListener(server *Server, bridge *BridgeManager, config *BridgeConf
 
 	// Initialize rate limiter if configured
 	if config.RequestRateLimit > 0 {
-		bl.rateLimiter = &connection_limits.GenericThrottle{
-			Duration: time.Minute,
-			Limit:    config.RequestRateLimit,
-		}
+		bl.rateLimiter = utils.NewGenericThrottle(time.Minute, config.RequestRateLimit)
 	}
 
 	// Start accepting connections
@@ -174,13 +170,10 @@ func (bl *BridgeListener) handleConnection(conn net.Conn) {
 		conn.SetDeadline(time.Now().Add(30 * time.Second))
 
 		// Rate limiting
-		if bl.rateLimiter != nil {
-			throttled, _ := bl.rateLimiter.Touch()
-			if throttled {
-				bl.sendError(conn, "Rate limit exceeded", "RATE_LIMIT")
-				bl.server.logger.Warning("bridge", "Rate limit exceeded for", remoteAddr)
-				return
-			}
+		if bl.rateLimiter != nil && !bl.rateLimiter.Try() {
+			bl.sendError(conn, "Rate limit exceeded", "RATE_LIMIT")
+			bl.server.logger.Warning("bridge", "Rate limit exceeded for", remoteAddr)
+			return
 		}
 
 		// Process request
@@ -289,7 +282,7 @@ func (bl *BridgeListener) handlePHPUserJoin(req *BridgeRequest) *BridgeResponse 
 		return NewBridgeError(err.Error(), "CREATE_FAILED")
 	}
 
-	bl.server.logger.Debug("bridge", "PHP user joined:", payload.Nickname, "status", strconv.Itoa(payload.Status))
+	bl.server.logger.Debug("bridge", "PHP user joined:", payload.Nickname, "status", payload.Status)
 
 	return NewBridgeResponse(MsgTypeAuthOK, map[string]interface{}{
 		"success": true,

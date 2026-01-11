@@ -135,9 +135,6 @@ func NewServer(config *Config, logger *logger.Manager) (*Server, error) {
 
 	server.apiHandler = newAPIHandler(server)
 
-	// Initialize bridge
-	server.bridge = NewBridgeManager(server)
-
 	if err := server.applyConfig(config); err != nil {
 		return nil, err
 	}
@@ -916,8 +913,6 @@ func (server *Server) applyConfig(config *Config) (err error) {
 
 	server.setupAPIListener(config)
 
-	server.setupBridge(config)
-
 	// set RPL_ISUPPORT
 	var newISupportReplies [][]string
 	if oldConfig != nil {
@@ -1027,36 +1022,6 @@ func (server *Server) setupAPIListener(config *Config) {
 		}
 	}(server.apiServer, server.apiListener)
 	server.logger.Info("server", "Started API listener", server.apiServer.Addr)
-}
-
-func (server *Server) setupBridge(config *Config) {
-	// Stop existing bridge if config changed or disabled
-	if server.bridge != nil && server.bridge.IsEnabled() {
-		oldConfig := server.bridge.config.Load()
-		if oldConfig != nil && (!config.Bridge.Enabled || oldConfig.ListenAddress != config.Bridge.ListenAddress) {
-			server.logger.Info("bridge", "Stopping bridge")
-			server.bridge.Stop()
-		}
-	}
-
-	if !config.Bridge.Enabled {
-		return
-	}
-
-	// Initialize and start bridge
-	err := server.bridge.Initialize(&config.Bridge)
-	if err != nil {
-		server.logger.Error("bridge", "Failed to initialize bridge:", err.Error())
-		return
-	}
-
-	err = server.bridge.Start()
-	if err != nil {
-		server.logger.Error("bridge", "Failed to start bridge:", err.Error())
-		return
-	}
-
-	server.logger.Info("bridge", "Bridge started successfully")
 }
 
 func (server *Server) loadDatastore(config *Config) error {

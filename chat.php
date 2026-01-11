@@ -24,140 +24,6 @@ ini_set('html_errors', 1);
 
 // Dasho (https://dasho.dev)
 
-/**
- * BridgeClient - Handles communication with the IRC bridge
- */
-class BridgeClient {
-	private $socket = null;
-	private $authKey = '';
-	private $connected = false;
-
-	public function __construct() {
-		if (defined('BRIDGE_AUTH_KEY')) {
-			$this->authKey = BRIDGE_AUTH_KEY;
-		}
-	}
-
-	public function __destruct() {
-		if ($this->socket) {
-			fclose($this->socket);
-		}
-	}
-
-	public function connect() {
-		if (!BRIDGE_ENABLED || empty($this->authKey)) {
-			return false;
-		}
-
-		$this->socket = @fsockopen(BRIDGE_HOST, BRIDGE_PORT, $errno, $errstr, 5);
-		if (!$this->socket) {
-			error_log("Bridge connection failed: $errstr ($errno)");
-			return false;
-		}
-
-		stream_set_timeout($this->socket, 5);
-		return $this->authenticate();
-	}
-
-	private function authenticate() {
-		$request = $this->buildRequest('AUTH', []);
-		$response = $this->send($request);
-
-		if ($response && isset($response['type']) && $response['type'] === 'AUTH_OK') {
-			$this->connected = true;
-			return true;
-		}
-
-		return false;
-	}
-
-	private function buildRequest($type, $payload) {
-		$ts = time();
-		$nonce = bin2hex(random_bytes(16));
-
-		$data = [
-			'type' => $type,
-			'protocol_version' => '1.0',
-			'ts' => $ts,
-			'nonce' => $nonce,
-			'payload' => $payload,
-		];
-
-		// HMAC: hash(key, type|ts|nonce|json(payload))
-		$payloadJson = json_encode($payload);
-		$signData = "$type|$ts|$nonce|$payloadJson";
-		$data['hmac'] = hash_hmac('sha256', $signData, $this->authKey);
-
-		return json_encode($data);
-	}
-
-	public function notifyUserJoin($userID, $nickname, $status) {
-		if (!$this->connected) return false;
-
-		$request = $this->buildRequest('PHP_USER_JOIN', [
-			'user_id' => (string)$userID,
-			'nickname' => $nickname,
-			'status' => (int)$status,
-		]);
-
-		return $this->send($request);
-	}
-
-	public function notifyUserLeave($userID) {
-		if (!$this->connected) return false;
-
-		$request = $this->buildRequest('PHP_USER_LEAVE', [
-			'user_id' => (string)$userID,
-		]);
-
-		return $this->send($request);
-	}
-
-	public function notifyMessage($userID, $sendto, $text, $isAction = false, $isPM = false, $toUser = null) {
-		if (!$this->connected) return false;
-
-		$request = $this->buildRequest('PHP_MESSAGE', [
-			'user_id' => (string)$userID,
-			'sendto' => $sendto,
-			'text' => $text,
-			'is_action' => $isAction,
-			'is_pm' => $isPM,
-			'to_user' => $toUser,
-		]);
-
-		return $this->send($request);
-	}
-
-	public function notifyDestChange($userID, $oldDest, $newDest) {
-		if (!$this->connected) return false;
-
-		$request = $this->buildRequest('PHP_DEST_CHANGE', [
-			'user_id' => (string)$userID,
-			'old_dest' => $oldDest,
-			'new_dest' => $newDest,
-		]);
-
-		return $this->send($request);
-	}
-
-	private function send($request) {
-		if (!$this->socket) return false;
-
-		fwrite($this->socket, $request . "\n");
-		$response = fgets($this->socket);
-
-		if ($response === false) {
-			return false;
-		}
-
-		return json_decode($response, true);
-	}
-
-	public function isConnected() {
-		return $this->connected;
-	}
-}
-
 send_headers();
 // initialize and load variables/configuration
 $I = []; // Translations
@@ -2626,35 +2492,14 @@ function get_current_room_name()
 // Modification change chat rooms
 function change_room()
 {
-	global $U, $db, $bridge;
-
-	// Track old room before changing
-	$oldRoom = $U['roomid'] !== null ? "r " . $U['roomid'] : "room";
-
+	global $U, $db;
 	if ($_REQUEST['room'] === '*') {
 		$stmt = $db->prepare('UPDATE ' . PREFIX . 'sessions SET roomid=NULL WHERE id=?;');
 		$stmt->execute([$U['id']]);
-		$newRoom = "room";
-		$U['roomid'] = null;
 	} else {
 		$stmt = $db->prepare('UPDATE ' . PREFIX . 'sessions SET roomid=(SELECT id FROM ' . PREFIX . 'rooms WHERE id=? AND access<=?) WHERE id=?;');
 		$stmt->execute([$_REQUEST['room'], $U['status'], $U['id']]);
-		$newRoom = "r " . $_REQUEST['room'];
-		$U['roomid'] = $_REQUEST['room'];
 	}
-
-	// Bridge integration: notify IRC of room change
-	if (BRIDGE_ENABLED && $oldRoom !== $newRoom) {
-		if (!isset($bridge) || !$bridge->isConnected()) {
-			$bridge = new BridgeClient();
-			$bridge->connect();
-		}
-
-		if ($bridge->isConnected()) {
-			$bridge->notifyDestChange($U['nickname'], $oldRoom, $newRoom);
-		}
-	}
-
 	// Set session flag to indicate room change for post box reload
 	$_SESSION['room_changed'] = true;
 }
@@ -6263,25 +6108,12 @@ function logout_chatter($names)
 
 function check_session()
 {
-	global $U, $bridge;
+	global $U;
 	parse_sessions();
 	check_expired();
 	check_kicked();
 	if ($U['entry'] == 0) {
 		send_waiting_room();
-	}
-
-	// Bridge integration: notify IRC when user joins
-	if (BRIDGE_ENABLED && $U['entry'] != 0 && !isset($_SESSION['bridge_joined'])) {
-		if (!isset($bridge) || !$bridge->isConnected()) {
-			$bridge = new BridgeClient();
-			$bridge->connect();
-		}
-
-		if ($bridge->isConnected()) {
-			$bridge->notifyUserJoin($U['nickname'], $U['nickname'], $U['status']);
-			$_SESSION['bridge_joined'] = true;
-		}
 	}
 }
 
@@ -7741,51 +7573,7 @@ function write_message($message)
 		error_log("[WRITE_MSG DEBUG ERROR] INSERT failed: " . $e->getMessage());
 		throw $e;
 	}
-
-	// Bridge integration: notify IRC of new message
-	if (BRIDGE_ENABLED && $message['poststatus'] < 9 && !empty($message['poster'])) {
-		global $bridge;
-		if (!isset($bridge) || !$bridge->isConnected()) {
-			$bridge = new BridgeClient();
-			$bridge->connect();
-		}
-
-		if ($bridge->isConnected()) {
-			// Determine sendto destination
-			if (!empty($message['recipient'])) {
-				$sendto = "pm";
-				$toUser = $message['recipient'];
-			} elseif ($message['allrooms'] == 1) {
-				// Map special broadcast destinations
-				if (isset($_REQUEST['sendto'])) {
-					$sendto = $_REQUEST['sendto'];
-				} else {
-					$sendto = "room";
-				}
-				$toUser = null;
-			} elseif ($message['roomid'] !== null) {
-				$sendto = "r " . $message['roomid'];
-				$toUser = null;
-			} else {
-				$sendto = "room";
-				$toUser = null;
-			}
-
-			// Check if message is /me action
-			$messageText = strip_tags($message['text']); // Remove HTML styling
-			$isAction = (strpos($messageText, '/me ') === 0);
-
-			$bridge->notifyMessage(
-				$message['poster'],
-				$sendto,
-				$messageText,
-				$isAction,
-				!empty($message['recipient']),
-				$toUser
-			);
-		}
-	}
-
+	
 	if ($message['poststatus'] < 9 && get_setting('sendmail')) {
 		$subject = 'New Chat message';
 		$headers = 'From: ' . get_setting('mailsender') . "\r\nX-Mailer: PHP/" . phpversion() . "\r\nContent-Type: text/html; charset=UTF-8\r\n";
@@ -8628,12 +8416,6 @@ function valid_nick($nick)
 	if ($len < 1 || $len > get_setting('maxname')) {
 		return false;
 	}
-
-	// Bridge integration: reject nicknames starting with irc_ or web_ (reserved for bridge)
-	if (BRIDGE_ENABLED && preg_match('/^(irc_|web_)/i', $nick)) {
-		return false;
-	}
-
 	return preg_match('/' . get_setting('nickregex') . '/u', $nick);
 }
 
@@ -10632,10 +10414,10 @@ function load_config()
 	define('LANG', 'en'); // Default language
 
 	// Bridge configuration for IRC integration
-	define('BRIDGE_ENABLED', true); // Enable/disable IRC bridge integration
+	define('BRIDGE_ENABLED', false); // Enable/disable IRC bridge integration
 	define('BRIDGE_HOST', '127.0.0.1'); // IRC bridge host (should be localhost)
 	define('BRIDGE_PORT', 6666); // IRC bridge port
-	define('BRIDGE_AUTH_KEY', 'C_Ey-_Kq5lWV9DvcZSjbtlUrVP771QAHyvTxkL-zRvw'); // Shared secret key for bridge authentication (must match IRC config)
+	define('BRIDGE_AUTH_KEY', ''); // Shared secret key for bridge authentication (must match IRC config)
 
 	if (MSGENCRYPTED) {
 		if (version_compare(PHP_VERSION, '7.2.0') < 0) {

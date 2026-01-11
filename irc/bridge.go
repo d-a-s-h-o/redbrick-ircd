@@ -5,10 +5,8 @@ package irc
 
 import (
 	"fmt"
-	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/ergochat/ergo/irc/modes"
@@ -27,29 +25,25 @@ type BridgeManager struct {
 	sessionMu sync.RWMutex
 
 	// User mappings
-	phpToIRC       map[string]string // PHP user ID → IRC nick
-	ircToPHP       map[string]string // IRC nick (casefolded) → PHP user ID
-	phpUserStatus  map[string]int    // PHP user ID → PHP status (0-8)
-	userChannels   map[string]string // PHP user ID → current channel
-	linkedAccounts map[string]string // PHP user ID → IRC account (casefolded)
-	userMappingsMu sync.RWMutex
+	phpToIRC        map[string]string // PHP user ID → IRC nick
+	ircToPHP        map[string]string // IRC nick (casefolded) → PHP user ID
+	phpUserStatus   map[string]int    // PHP user ID → PHP status (0-8)
+	userChannels    map[string]string // PHP user ID → current channel
+	linkedAccounts  map[string]string // PHP user ID → IRC account (casefolded)
+	userMappingsMu  sync.RWMutex
 
 	// Channel/Room mappings
-	phpToChannel map[string]string // PHP sendto → IRC channel name
-	channelToPHP map[string]string // IRC channel (casefolded) → PHP sendto
-	mappingsMu   sync.RWMutex
+	phpToChannel    map[string]string // PHP sendto → IRC channel name
+	channelToPHP    map[string]string // IRC channel (casefolded) → PHP sendto
+	mappingsMu      sync.RWMutex
 
 	// Event deduplication
-	seenEvents    map[string]int64 // event ID → timestamp
-	seenEventsMu  sync.RWMutex
-	maxSeenEvents int
+	seenEvents      *utils.RingBuffer // Recent event IDs
+	seenEventsMu    sync.RWMutex
 
 	// Nonce tracking (replay prevention)
-	seenNonces   map[string]int64 // nonce → timestamp
-	seenNoncesMu sync.RWMutex
-
-	// Account linking
-	linkingManager *LinkingManager
+	seenNonces      map[string]int64  // nonce → timestamp
+	seenNoncesMu    sync.RWMutex
 }
 
 // BridgeSession represents an active PHP connection
@@ -64,19 +58,20 @@ type BridgeSession struct {
 // NewBridgeManager creates a new bridge manager
 func NewBridgeManager(server *Server) *BridgeManager {
 	bm := &BridgeManager{
-		server:         server,
-		sessions:       make(map[string]*BridgeSession),
-		phpToIRC:       make(map[string]string),
-		ircToPHP:       make(map[string]string),
-		phpUserStatus:  make(map[string]int),
-		userChannels:   make(map[string]string),
-		linkedAccounts: make(map[string]string),
-		phpToChannel:   make(map[string]string),
-		channelToPHP:   make(map[string]string),
-		seenEvents:     make(map[string]int64),
-		maxSeenEvents:  1000,
-		seenNonces:     make(map[string]int64),
+		server:          server,
+		sessions:        make(map[string]*BridgeSession),
+		phpToIRC:        make(map[string]string),
+		ircToPHP:        make(map[string]string),
+		phpUserStatus:   make(map[string]int),
+		userChannels:    make(map[string]string),
+		linkedAccounts:  make(map[string]string),
+		phpToChannel:    make(map[string]string),
+		channelToPHP:    make(map[string]string),
+		seenNonces:      make(map[string]int64),
 	}
+
+	// Initialize event deduplication ring buffer (1000 events)
+	bm.seenEvents = utils.NewRingBuffer(1000)
 
 	return bm
 }
@@ -102,9 +97,6 @@ func (bm *BridgeManager) Initialize(config *BridgeConfig) error {
 		bm.channelToPHP[cfChannel] = phpSendto
 	}
 	bm.mappingsMu.Unlock()
-
-	// Initialize linking manager
-	bm.linkingManager = NewLinkingManager(time.Duration(config.linkTokenExpiry))
 
 	bm.enabled.Store(true)
 	bm.server.logger.Info("bridge", "Bridge initialized successfully")
@@ -133,10 +125,6 @@ func (bm *BridgeManager) Start() error {
 func (bm *BridgeManager) Stop() {
 	if bm.listener != nil {
 		bm.listener.Stop()
-	}
-
-	if bm.linkingManager != nil {
-		bm.linkingManager.Stop()
 	}
 
 	// Disconnect all PHP users
@@ -181,7 +169,7 @@ func (bm *BridgeManager) CreatePHPUser(phpUserID, nickname string, phpStatus int
 	if existingNick, exists := bm.phpToIRC[phpUserID]; exists {
 		// Update existing user
 		bm.phpUserStatus[phpUserID] = phpStatus
-		bm.server.logger.Debug("bridge", "Updated PHP user", phpUserID, "→", existingNick, "status", strconv.Itoa(phpStatus))
+		bm.server.logger.Debug("bridge", "Updated PHP user", phpUserID, "→", existingNick, "status", phpStatus)
 		return nil
 	}
 
@@ -214,7 +202,7 @@ func (bm *BridgeManager) CreatePHPUser(phpUserID, nickname string, phpStatus int
 		go bm.createPseudoClient(ircNick, phpUserID, phpStatus)
 	}
 
-	bm.server.logger.Info("bridge", "Created PHP user", phpUserID, "→", ircNick, "status", strconv.Itoa(phpStatus), "linked", strconv.FormatBool(isLinked))
+	bm.server.logger.Info("bridge", "Created PHP user", phpUserID, "→", ircNick, "status", phpStatus, "linked", isLinked)
 	return nil
 }
 
@@ -262,8 +250,8 @@ func (bm *BridgeManager) createPseudoClient(ircNick, phpUserID string, phpStatus
 		readMarkers,
 		uModes,
 		realname,
-		nil, // push subscriptions
-		nil, // metadata
+		nil,  // push subscriptions
+		nil,  // metadata
 	)
 
 	bm.server.logger.Info("bridge", "Created pseudo-client", ircNick)
@@ -467,7 +455,7 @@ func (bm *BridgeManager) GetEffectiveRank(nickname string) int {
 
 	// Check if IRC operator
 	client := bm.server.clients.Get(nickname)
-	if client != nil && client.HasMode(modes.Operator) {
+	if client != nil && client.HasMode(modes.Oper) {
 		return 4 // Between PHP status 3 and 5
 	}
 
@@ -511,57 +499,14 @@ func (bm *BridgeManager) IsEventFromBridge(client *Client) bool {
 func (bm *BridgeManager) HasSeenEvent(eventID string) bool {
 	bm.seenEventsMu.RLock()
 	defer bm.seenEventsMu.RUnlock()
-	_, seen := bm.seenEvents[eventID]
-	return seen
+	return bm.seenEvents.Contains(eventID)
 }
 
 // MarkEventSeen marks an event ID as seen
 func (bm *BridgeManager) MarkEventSeen(eventID string) {
 	bm.seenEventsMu.Lock()
 	defer bm.seenEventsMu.Unlock()
-
-	// Add event with current timestamp
-	bm.seenEvents[eventID] = time.Now().Unix()
-
-	// If map is too large, remove oldest entries
-	if len(bm.seenEvents) > bm.maxSeenEvents {
-		bm.cleanupSeenEvents()
-	}
-}
-
-// cleanupSeenEvents removes old entries (must be called with lock held)
-func (bm *BridgeManager) cleanupSeenEvents() {
-	// Remove events older than 1 hour
-	cutoff := time.Now().Add(-1 * time.Hour).Unix()
-	for eventID, ts := range bm.seenEvents {
-		if ts < cutoff {
-			delete(bm.seenEvents, eventID)
-		}
-	}
-
-	// If still too large, remove oldest half
-	if len(bm.seenEvents) > bm.maxSeenEvents {
-		type eventEntry struct {
-			id string
-			ts int64
-		}
-		var entries []eventEntry
-		for id, ts := range bm.seenEvents {
-			entries = append(entries, eventEntry{id, ts})
-		}
-		// Sort by timestamp (oldest first)
-		for i := 0; i < len(entries); i++ {
-			for j := i + 1; j < len(entries); j++ {
-				if entries[i].ts > entries[j].ts {
-					entries[i], entries[j] = entries[j], entries[i]
-				}
-			}
-		}
-		// Remove oldest half
-		for i := 0; i < len(entries)/2; i++ {
-			delete(bm.seenEvents, entries[i].id)
-		}
-	}
+	bm.seenEvents.Add(eventID)
 }
 
 // HasSeenNonce checks if a nonce has been used before

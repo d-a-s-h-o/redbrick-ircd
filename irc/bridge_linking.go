@@ -7,9 +7,10 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"fmt"
-	"strconv"
 	"sync"
 	"time"
+
+	"github.com/ergochat/ergo/irc/utils"
 )
 
 // LinkToken represents a pending account link
@@ -311,7 +312,7 @@ func (bm *BridgeManager) GetLinkingStatus(phpUserID string) string {
 func (bm *BridgeManager) NotifyLinkComplete(phpUserID, ircAccount string, success bool) {
 	// This would send an async notification to PHP
 	// For now, PHP will poll via LINK_STATUS
-	bm.server.logger.Debug("bridge", "Link complete notification:", phpUserID, "→", ircAccount, "success", strconv.FormatBool(success))
+	bm.server.logger.Debug("bridge", "Link complete notification:", phpUserID, "→", ircAccount, "success", success)
 }
 
 // UnlinkAccount removes a link between PHP and IRC accounts

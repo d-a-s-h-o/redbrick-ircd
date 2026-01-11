@@ -552,16 +552,16 @@ type TorListenersConfig struct {
 
 // BridgeConfig configures the PHP chat bridge
 type BridgeConfig struct {
-	Enabled          bool
-	ListenAddress    string   `yaml:"listen-address"`
-	AuthKey          string   `yaml:"auth-key"`
-	AllowedIPs       []string `yaml:"allowed-ips"`
-	allowedIPNets    []net.IPNet
-	ConnectionLimit  int              `yaml:"connection-limit"`
-	RequestRateLimit int              `yaml:"request-rate-limit"`
-	LinkTokenExpiry  custime.Duration `yaml:"link-token-expiry"`
-	linkTokenExpiry  time.Duration
-	DefaultMappings  map[string]string `yaml:"default-mappings"`
+	Enabled             bool
+	ListenAddress       string            `yaml:"listen-address"`
+	AuthKey             string            `yaml:"auth-key"`
+	AllowedIPs          []string          `yaml:"allowed-ips"`
+	allowedIPNets       []net.IPNet
+	ConnectionLimit     int               `yaml:"connection-limit"`
+	RequestRateLimit    int               `yaml:"request-rate-limit"`
+	LinkTokenExpiry     custime.Duration  `yaml:"link-token-expiry"`
+	linkTokenExpiry     time.Duration
+	DefaultMappings     map[string]string `yaml:"default-mappings"`
 }
 
 // Config defines the overall configuration.
@@ -651,8 +651,6 @@ type Config struct {
 		BearerTokens     []string `yaml:"bearer-tokens"`
 		bearerTokenBytes [][]byte
 	} `yaml:"api"`
-
-	Bridge BridgeConfig
 
 	Roleplay struct {
 		Enabled        bool
@@ -1499,34 +1497,6 @@ func LoadConfig(filename string) (config *Config, err error) {
 	config.Server.secureNets, err = utils.ParseNetList(config.Server.SecureNetDefs)
 	if err != nil {
 		return nil, fmt.Errorf("Could not parse secure-nets: %v\n", err.Error())
-	}
-
-	// Bridge configuration postprocessing
-	if config.Bridge.Enabled {
-		if config.Bridge.AuthKey == "" {
-			return nil, fmt.Errorf("bridge is enabled but no auth-key is configured")
-		}
-		if config.Bridge.ListenAddress == "" {
-			return nil, fmt.Errorf("bridge is enabled but no listen-address is configured")
-		}
-		// Parse allowed IPs
-		config.Bridge.allowedIPNets, err = utils.ParseNetList(config.Bridge.AllowedIPs)
-		if err != nil {
-			return nil, fmt.Errorf("Could not parse bridge allowed-ips: %v", err.Error())
-		}
-		// Parse link token expiry
-		if config.Bridge.LinkTokenExpiry == 0 {
-			config.Bridge.linkTokenExpiry = 10 * time.Minute // default
-		} else {
-			config.Bridge.linkTokenExpiry = time.Duration(config.Bridge.LinkTokenExpiry)
-		}
-		// Set defaults
-		if config.Bridge.ConnectionLimit == 0 {
-			config.Bridge.ConnectionLimit = 10
-		}
-		if config.Bridge.RequestRateLimit == 0 {
-			config.Bridge.RequestRateLimit = 100
-		}
 	}
 
 	rawRegexp := config.Accounts.VHosts.ValidRegexpRaw
