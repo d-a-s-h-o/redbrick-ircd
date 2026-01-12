@@ -318,6 +318,8 @@ add_user_warning($target_nick, $reason, false, $U['nickname'], 1, 10);
 			} else {
 				send_delete_account();
 			}
+		} elseif ($_REQUEST['do'] === 'generate_link_token') {
+			$arg = generate_irc_link_token();
 		}
 		send_profile($arg);
 	} elseif ($_REQUEST['action'] === 'logout') {
@@ -5464,6 +5466,51 @@ function send_profile($arg = '')
 		echo '</table></td></tr></table></td></tr>';
 		thr();
 	}
+
+	// IRC Account Linking (if bridge is enabled)
+	if (get_bridge_setting('enabled') === '1') {
+		echo '<tr><td><table id="irc_link"><tr><th colspan="2">IRC Account Linking</th></tr>';
+
+		// Check if user already has a linked account
+		$stmt = $db->prepare('SELECT irc_account, created_at, verified_at FROM ' . PREFIX . 'account_links WHERE php_user_id = ?');
+		$stmt->execute([$U['id']]);
+		$link = $stmt->fetch(PDO::FETCH_ASSOC);
+
+		if ($link) {
+			// User has a linked account
+			echo '<tr><td colspan="2"><strong>Status:</strong> Linked to IRC account <code>' . htmlspecialchars($link['irc_account']) . '</code></td></tr>';
+			echo '<tr><td colspan="2"><small>Linked on ' . date('Y-m-d H:i:s', $link['verified_at'] ?: $link['created_at']) . '</small></td></tr>';
+		} else {
+			// User doesn't have a linked account
+			echo '<tr><td colspan="2"><strong>Status:</strong> Not linked to any IRC account</td></tr>';
+
+			// Check if there's a pending token for this user
+			if (isset($_SESSION['irc_link_token']) && isset($_SESSION['irc_link_token_expiry']) && $_SESSION['irc_link_token_expiry'] > time()) {
+				// Display the token and instructions
+				echo '<tr><td colspan="2" style="background-color: #ffffcc; padding: 10px; border: 1px solid #ccc;">';
+				echo '<strong>Your Link Token:</strong> <code style="font-size: 1.2em; background: #fff; padding: 5px;">' . htmlspecialchars($_SESSION['irc_link_token']) . '</code><br><br>';
+				echo '<strong>Instructions:</strong><br>';
+				echo '1. Connect to IRC and register your nickname:<br>';
+				echo '&nbsp;&nbsp;&nbsp;<code>/msg NickServ REGISTER password email@example.com</code><br>';
+				echo '2. Identify with your password:<br>';
+				echo '&nbsp;&nbsp;&nbsp;<code>/msg NickServ IDENTIFY password</code><br>';
+				echo '3. Link your account using the token above:<br>';
+				echo '&nbsp;&nbsp;&nbsp;<code>/msg NickServ LINK ' . htmlspecialchars($_SESSION['irc_link_token']) . '</code><br><br>';
+				echo '<small>Token expires in ' . round(($_SESSION['irc_link_token_expiry'] - time()) / 60) . ' minutes</small>';
+				echo '</td></tr>';
+			} else {
+				// Show button to generate token
+				echo '<tr><td colspan="2">';
+				echo 'Link your PHP chat account with your IRC account to synchronize permissions and identity.<br><br>';
+				echo form('profile', 'generate_link_token') . submit('Generate Link Token') . '</form>';
+				echo '</td></tr>';
+			}
+		}
+
+		echo '</table></td></tr>';
+		thr();
+	}
+
 	echo '<tr><td>' . submit($I['savechanges']) . '</td></tr></table></form>';
 	if ($U['status'] > 1 && $U['status'] < 8) {
 		echo '<br>' . form('profile', 'delete') . submit($I['deleteacc'], 'class="delbutton"') . '</form>';
@@ -5697,6 +5744,9 @@ function handle_bridge_request()
 				break;
 			case 'ban':
 				$result = handle_bridge_ban($data);
+				break;
+			case 'validate_token':
+				$result = handle_bridge_validate_token($data);
 				break;
 			case 'link_complete':
 				$result = handle_bridge_link_complete($data);
@@ -6037,6 +6087,87 @@ function handle_bridge_link_complete($data)
 	return ['status' => 'ok'];
 }
 
+function generate_irc_link_token()
+{
+	global $U, $db;
+
+	// Check if bridge is enabled
+	if (get_bridge_setting('enabled') !== '1') {
+		return 'IRC bridge is not enabled.';
+	}
+
+	// Check if user already has a linked account
+	$stmt = $db->prepare('SELECT irc_account FROM ' . PREFIX . 'account_links WHERE php_user_id = ?');
+	$stmt->execute([$U['id']]);
+	if ($stmt->fetch(PDO::FETCH_ASSOC)) {
+		return 'Your account is already linked to an IRC account.';
+	}
+
+	// Generate a random token (16 characters, alphanumeric)
+	$token = bin2hex(random_bytes(8));
+
+	// Set expiry (15 minutes from now)
+	$expiry = time() + (15 * 60);
+
+	// Store token in session
+	$_SESSION['irc_link_token'] = $token;
+	$_SESSION['irc_link_token_expiry'] = $expiry;
+	$_SESSION['irc_link_token_user_id'] = $U['id'];
+	$_SESSION['irc_link_token_username'] = $U['nickname'];
+
+	// Also store in database for validation by IRC
+	$stmt = $db->prepare('INSERT INTO ' . PREFIX . 'bridge_link_tokens (token, php_user_id, php_username, created_at, expires_at)
+		VALUES (?, ?, ?, ?, ?)
+		ON DUPLICATE KEY UPDATE token = ?, php_user_id = ?, php_username = ?, created_at = ?, expires_at = ?');
+	$now = time();
+	$stmt->execute([$token, $U['id'], $U['nickname'], $now, $expiry, $token, $U['id'], $U['nickname'], $now, $expiry]);
+
+	return 'Link token generated. Follow the instructions below to link your IRC account.';
+}
+
+function handle_bridge_validate_token($data)
+{
+	global $db;
+
+	$token = $data['token'] ?? null;
+
+	if (empty($token)) {
+		throw new Exception('Missing token');
+	}
+
+	// Look up token in database
+	$stmt = $db->prepare('SELECT php_user_id, php_username, expires_at FROM ' . PREFIX . 'bridge_link_tokens WHERE token = ?');
+	$stmt->execute([$token]);
+	$token_data = $stmt->fetch(PDO::FETCH_ASSOC);
+
+	if (!$token_data) {
+		log_bridge_audit('validate_token', $data['event_id'] ?? null, null, null, null, 'Token not found', 0);
+		return ['status' => 'error', 'message' => 'Invalid token'];
+	}
+
+	// Check if token is expired
+	if ($token_data['expires_at'] < time()) {
+		// Delete expired token
+		$stmt = $db->prepare('DELETE FROM ' . PREFIX . 'bridge_link_tokens WHERE token = ?');
+		$stmt->execute([$token]);
+
+		log_bridge_audit('validate_token', $data['event_id'] ?? null, $token_data['php_username'], null, null, 'Token expired', 0);
+		return ['status' => 'error', 'message' => 'Token expired'];
+	}
+
+	// Token is valid - return user info and delete token
+	$stmt = $db->prepare('DELETE FROM ' . PREFIX . 'bridge_link_tokens WHERE token = ?');
+	$stmt->execute([$token]);
+
+	log_bridge_audit('validate_token', $data['event_id'] ?? null, $token_data['php_username'], null, null, 'Token validated successfully', 1);
+
+	return [
+		'status' => 'ok',
+		'php_user_id' => $token_data['php_user_id'],
+		'php_username' => $token_data['php_username']
+	];
+}
+
 // Bridge helper functions
 
 function get_bridge_setting($setting)
@@ -6068,13 +6199,26 @@ function get_room_id_for_destination($destination)
 {
 	global $db;
 
-	// "room" means main room (null/0)
-	if ($destination === 'room') {
-		return null;
+	// Parse destination format:
+	// "room:*" or "room" = main room (null)
+	// "room:6" = room ID 6
+	// "s 31" = members channel (no room ID, null)
+	// "s 48" = staff channel (no room ID, null)
+	// "s 58" = admin channel (no room ID, null)
+
+	if ($destination === 'room' || $destination === 'room:*') {
+		return null; // Main room
 	}
 
-	// "s XX" means status channel - map to room ID
-	// For now, return null (main room) - proper room mapping would need more logic
+	if (strpos($destination, 'room:') === 0) {
+		$room_id = substr($destination, 5); // Extract ID after "room:"
+		if ($room_id === '*') {
+			return null;
+		}
+		return (int)$room_id;
+	}
+
+	// Status channels (s 31, s 48, s 58) don't have room IDs
 	return null;
 }
 
@@ -6796,7 +6940,12 @@ function write_new_session($password)
 		}
 
 		// Notify IRC bridge of user join
-		$destination = isset($U['roomid']) && $U['roomid'] ? 's ' . $U['roomid'] : 'room';
+		// Determine destination based on user's room
+		if (isset($U['roomid']) && $U['roomid']) {
+			$destination = 'room:' . $U['roomid'];
+		} else {
+			$destination = 'room:*'; // Main room
+		}
 		notify_irc_user_join($U['nickname'], $destination);
 	}
 }
@@ -6890,7 +7039,11 @@ function kill_session()
 	}
 
 	// Notify IRC bridge of user leave
-	$destination = isset($U['roomid']) && $U['roomid'] ? 's ' . $U['roomid'] : 'room';
+	if (isset($U['roomid']) && $U['roomid']) {
+		$destination = 'room:' . $U['roomid'];
+	} else {
+		$destination = 'room:*'; // Main room
+	}
 	notify_irc_user_leave($U['nickname'], $destination);
 }
 
@@ -8351,7 +8504,20 @@ function write_message($message)
 
 	// Notify IRC bridge of message (only for regular chat messages, not system messages or PMs)
 	if (!empty($message['poster']) && $message['delstatus'] != 4 && $message['poststatus'] != 9 && empty($message['recipient'])) {
-		$destination = isset($message['roomid']) && $message['roomid'] ? 's ' . $message['roomid'] : 'room';
+		// Determine destination based on roomid and poststatus
+		// Priority: if roomid is set, use that; otherwise infer from poststatus
+		if (isset($message['roomid']) && $message['roomid']) {
+			$destination = 'room:' . $message['roomid'];
+		} elseif ($message['poststatus'] == 3) {
+			$destination = 's 31'; // Members channel
+		} elseif ($message['poststatus'] == 5) {
+			$destination = 's 48'; // Staff channel
+		} elseif ($message['poststatus'] >= 6) {
+			$destination = 's 58'; // Admin channel
+		} else {
+			$destination = 'room:*'; // Main room (default)
+		}
+
 		// Check if message is a /me action (contains <em>* )
 		$is_action = (strpos($message['text'], '<em>* ') === 0);
 		if ($is_action) {
@@ -9139,6 +9305,26 @@ function save_setup($C)
 		$window = (int)$_REQUEST['bridge_replay_window'];
 		if ($window >= 60 && $window <= 600) {
 			set_bridge_setting('replay_window', (string)$window);
+		}
+	}
+
+	// Handle bridge mapping deletion
+	if (isset($_REQUEST['delete_mapping'])) {
+		$stmt = $db->prepare('DELETE FROM ' . PREFIX . 'bridge_mappings WHERE destination_key = ?');
+		$stmt->execute([$_REQUEST['delete_mapping']]);
+	}
+
+	// Handle new bridge mapping
+	if (!empty($_REQUEST['new_mapping_dest']) && !empty($_REQUEST['new_mapping_channel'])) {
+		$dest = trim($_REQUEST['new_mapping_dest']);
+		$channel = trim($_REQUEST['new_mapping_channel']);
+
+		// Validate destination format (room:*, room:ID, s XX)
+		if (preg_match('/^(room:\*|room:\d+|s \d+)$/', $dest) && preg_match('/^#[a-zA-Z0-9_-]+$/', $channel)) {
+			$stmt = $db->prepare('INSERT INTO ' . PREFIX . 'bridge_mappings (destination_key, irc_channel, updated_at, updated_by)
+				VALUES (?, ?, ?, ?)
+				ON DUPLICATE KEY UPDATE irc_channel = ?, updated_at = ?, updated_by = ?');
+			$stmt->execute([$dest, $channel, time(), $U['nickname'], $channel, time(), $U['nickname']]);
 		}
 	}
 }
@@ -10558,6 +10744,17 @@ function update_db()
 			)$diskengine$charset;");
 			$db->exec('CREATE INDEX IF NOT EXISTS ' . PREFIX . 'account_links_irc ON ' . PREFIX . 'account_links(irc_account);');
 
+			// Bridge link tokens table (for account linking)
+			$db->exec('CREATE TABLE IF NOT EXISTS ' . PREFIX . "bridge_link_tokens (
+				token varchar(50) NOT NULL PRIMARY KEY,
+				php_user_id integer NOT NULL,
+				php_username varchar(50) NOT NULL,
+				created_at integer NOT NULL,
+				expires_at integer NOT NULL
+			)$diskengine$charset;");
+			$db->exec('CREATE INDEX IF NOT EXISTS ' . PREFIX . 'bridge_link_tokens_user ON ' . PREFIX . 'bridge_link_tokens(php_user_id);');
+			$db->exec('CREATE INDEX IF NOT EXISTS ' . PREFIX . 'bridge_link_tokens_expiry ON ' . PREFIX . 'bridge_link_tokens(expires_at);');
+
 			// Bridge audit log table
 			$db->exec('CREATE TABLE IF NOT EXISTS ' . PREFIX . "bridge_audit (
 				id $primary,
@@ -10583,7 +10780,7 @@ function update_db()
 
 			// Insert default mappings (matching Ergo default.yaml)
 			$db->exec('INSERT IGNORE INTO ' . PREFIX . "bridge_mappings (destination_key, irc_channel, updated_at, updated_by) VALUES
-				('room', '#main', " . time() . ", 'system'),
+				('room:*', '#main', " . time() . ", 'system'),
 				('s 31', '#members', " . time() . ", 'system'),
 				('s 48', '#staff', " . time() . ", 'system'),
 				('s 58', '#admin', " . time() . ", 'system');");

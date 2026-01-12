@@ -1210,19 +1210,18 @@ bridge:
     link-token-expiry: 15m
 
     # Default channel/room mappings (PHP sendto → IRC channel)
+    # Supported PHP sendto formats:
+    #   "room:*" - Main room (sendto=room&room=*)
+    #   "room:6" - Specific room ID (sendto=room&room=6)
+    #   "s 31" - Members channel (sendto=s 31)
+    #   "s 48" - Staff channel (sendto=s 48)
+    #   "s 58" - Admin channel (sendto=s 58)
     # These can be updated dynamically via the bridge protocol
     default-mappings:
-        "room": "#main"
+        "room:*": "#main"
         "s 31": "#members"
         "s 48": "#staff"
         "s 58": "#admin"
-
-    # Maximum number of concurrent bridge connections allowed.
-    connection-limit: 10
-
-    # Maximum number of requests per minute from all bridge connections combined.
-    # This helps prevent abuse and resource exhaustion.
-    request-rate-limit: 100
 
     # How long account linking tokens remain valid before expiring.
     # Users must complete the NickServ LINK command within this timeframe.
