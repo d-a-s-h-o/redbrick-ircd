@@ -2364,6 +2364,16 @@ func dispatchMessageToTarget(client *Client, tags map[string]string, histType hi
 			return
 		}
 		channel.SendSplitMessage(command, lowestPrefix, tags, client, message, rb)
+		// Bridge notification for channel message
+		if command == "PRIVMSG" || command == "NOTICE" {
+			isAction := strings.HasPrefix(message.Message, "\x01ACTION ")
+			actualMessage := message.Message
+			if isAction {
+				actualMessage = strings.TrimPrefix(actualMessage, "\x01ACTION ")
+				actualMessage = strings.TrimSuffix(actualMessage, "\x01")
+			}
+			server.onChannelMessage(client, channel.Name(), actualMessage, isAction)
+		}
 	} else if target[0] == '$' && len(target) > 2 && client.Oper().HasRoleCapab("massmessage") {
 		details := client.Details()
 		matcher, err := utils.CompileGlob(target[2:], false)
@@ -2454,6 +2464,18 @@ func dispatchMessageToTarget(client *Client, tags map[string]string, histType hi
 		}
 
 		isBot := client.HasMode(modes.Bot)
+
+		// Bridge notification for private message
+		if command == "PRIVMSG" || command == "NOTICE" {
+			isAction := strings.HasPrefix(message.Message, "\x01ACTION ")
+			actualMessage := message.Message
+			if isAction {
+				actualMessage = strings.TrimPrefix(actualMessage, "\x01ACTION ")
+				actualMessage = strings.TrimSuffix(actualMessage, "\x01")
+			}
+			server.onPrivateMessage(client, tnick, actualMessage, isAction)
+		}
+
 		for _, session := range deliverySessions {
 			hasTagsCap := session.capabilities.Has(caps.MessageTags)
 			// don't send TAGMSG at all if they don't have the tags cap

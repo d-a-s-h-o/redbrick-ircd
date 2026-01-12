@@ -771,6 +771,8 @@ type Config struct {
 		vapidKeys        *webpush.VAPIDKeys
 	} `yaml:"webpush"`
 
+	Bridge BridgeConfig
+
 	Filename string
 }
 
@@ -1497,6 +1499,22 @@ func LoadConfig(filename string) (config *Config, err error) {
 	config.Server.secureNets, err = utils.ParseNetList(config.Server.SecureNetDefs)
 	if err != nil {
 		return nil, fmt.Errorf("Could not parse secure-nets: %v\n", err.Error())
+	}
+
+	// Bridge configuration
+	if config.Bridge.Enabled {
+		if config.Bridge.AuthKey == "" {
+			return nil, errors.New("Bridge enabled but auth-key is empty")
+		}
+		config.Bridge.allowedIPNets, err = utils.ParseNetList(config.Bridge.AllowedIPs)
+		if err != nil {
+			return nil, fmt.Errorf("Could not parse bridge allowed-ips: %v", err.Error())
+		}
+		if config.Bridge.LinkTokenExpiry == 0 {
+			config.Bridge.linkTokenExpiry = 15 * time.Minute // Default 15 minutes
+		} else {
+			config.Bridge.linkTokenExpiry = time.Duration(config.Bridge.LinkTokenExpiry)
+		}
 	}
 
 	rawRegexp := config.Accounts.VHosts.ValidRegexpRaw

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/ergochat/ergo/irc/modes"
@@ -38,12 +39,15 @@ type BridgeManager struct {
 	mappingsMu      sync.RWMutex
 
 	// Event deduplication
-	seenEvents      *utils.RingBuffer // Recent event IDs
+	seenEvents      map[string]int64  // event ID → timestamp
 	seenEventsMu    sync.RWMutex
 
 	// Nonce tracking (replay prevention)
 	seenNonces      map[string]int64  // nonce → timestamp
 	seenNoncesMu    sync.RWMutex
+
+	// Account linking
+	linkingManager  *LinkingManager
 }
 
 // BridgeSession represents an active PHP connection
@@ -68,10 +72,8 @@ func NewBridgeManager(server *Server) *BridgeManager {
 		phpToChannel:    make(map[string]string),
 		channelToPHP:    make(map[string]string),
 		seenNonces:      make(map[string]int64),
+		seenEvents:      make(map[string]int64),
 	}
-
-	// Initialize event deduplication ring buffer (1000 events)
-	bm.seenEvents = utils.NewRingBuffer(1000)
 
 	return bm
 }
@@ -83,6 +85,12 @@ func (bm *BridgeManager) Initialize(config *BridgeConfig) error {
 	if !config.Enabled {
 		bm.enabled.Store(false)
 		return nil
+	}
+
+	// Initialize linking manager
+	if config.linkTokenExpiry > 0 {
+		bm.linkingManager = NewLinkingManager(config.linkTokenExpiry)
+		bm.server.logger.Info("bridge", "Linking manager initialized with expiry", fmt.Sprintf("%v", config.linkTokenExpiry))
 	}
 
 	// Initialize default mappings
@@ -127,6 +135,10 @@ func (bm *BridgeManager) Stop() {
 		bm.listener.Stop()
 	}
 
+	if bm.linkingManager != nil {
+		bm.linkingManager.Stop()
+	}
+
 	// Disconnect all PHP users
 	bm.userMappingsMu.Lock()
 	phpUsers := make([]string, 0, len(bm.phpToIRC))
@@ -169,7 +181,7 @@ func (bm *BridgeManager) CreatePHPUser(phpUserID, nickname string, phpStatus int
 	if existingNick, exists := bm.phpToIRC[phpUserID]; exists {
 		// Update existing user
 		bm.phpUserStatus[phpUserID] = phpStatus
-		bm.server.logger.Debug("bridge", "Updated PHP user", phpUserID, "→", existingNick, "status", phpStatus)
+		bm.server.logger.Debug("bridge", "Updated PHP user", phpUserID, "→", existingNick, "status", fmt.Sprintf("%d", phpStatus))
 		return nil
 	}
 
@@ -202,7 +214,7 @@ func (bm *BridgeManager) CreatePHPUser(phpUserID, nickname string, phpStatus int
 		go bm.createPseudoClient(ircNick, phpUserID, phpStatus)
 	}
 
-	bm.server.logger.Info("bridge", "Created PHP user", phpUserID, "→", ircNick, "status", phpStatus, "linked", isLinked)
+	bm.server.logger.Info("bridge", "Created PHP user", phpUserID, "→", ircNick, "status", fmt.Sprintf("%d", phpStatus), "linked", fmt.Sprintf("%v", isLinked))
 	return nil
 }
 
@@ -455,7 +467,7 @@ func (bm *BridgeManager) GetEffectiveRank(nickname string) int {
 
 	// Check if IRC operator
 	client := bm.server.clients.Get(nickname)
-	if client != nil && client.HasMode(modes.Oper) {
+	if client != nil && client.HasMode(modes.Operator) {
 		return 4 // Between PHP status 3 and 5
 	}
 
@@ -498,15 +510,32 @@ func (bm *BridgeManager) IsEventFromBridge(client *Client) bool {
 // HasSeenEvent checks if an event ID has been seen recently
 func (bm *BridgeManager) HasSeenEvent(eventID string) bool {
 	bm.seenEventsMu.RLock()
-	defer bm.seenEventsMu.RUnlock()
-	return bm.seenEvents.Contains(eventID)
+	_, seen := bm.seenEvents[eventID]
+	bm.seenEventsMu.RUnlock()
+	return seen
 }
 
 // MarkEventSeen marks an event ID as seen
 func (bm *BridgeManager) MarkEventSeen(eventID string) {
 	bm.seenEventsMu.Lock()
-	defer bm.seenEventsMu.Unlock()
-	bm.seenEvents.Add(eventID)
+	bm.seenEvents[eventID] = time.Now().Unix()
+	bm.seenEventsMu.Unlock()
+
+	// Cleanup old events (older than MaxTimestampSkew)
+	go bm.cleanupOldEvents()
+}
+
+// cleanupOldEvents removes event IDs older than the max timestamp skew
+func (bm *BridgeManager) cleanupOldEvents() {
+	cutoff := time.Now().Add(-MaxTimestampSkew).Unix()
+
+	bm.seenEventsMu.Lock()
+	for eventID, ts := range bm.seenEvents {
+		if ts < cutoff {
+			delete(bm.seenEvents, eventID)
+		}
+	}
+	bm.seenEventsMu.Unlock()
 }
 
 // HasSeenNonce checks if a nonce has been used before

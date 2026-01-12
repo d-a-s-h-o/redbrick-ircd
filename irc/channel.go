@@ -846,6 +846,9 @@ func (channel *Channel) Join(client *Client, key string, isSajoin bool, rb *Resp
 		channel.AddHistoryItem(histItem, details.account)
 	}
 
+	// Bridge notification for JOIN
+	channel.server.onChannelJoin(client, chname)
+
 	if rb == nil {
 		return nil, ""
 	}
@@ -1018,6 +1021,9 @@ func (channel *Channel) Part(client *Client, message string, rb *ResponseBuffer)
 	}
 
 	channel.Quit(client)
+
+	// Bridge notification for PART
+	channel.server.onChannelPart(client, chname)
 
 	splitMessage := utils.MakeMessage(message)
 
@@ -1544,6 +1550,9 @@ func (channel *Channel) Kick(client *Client, target *Client, comment string, rb 
 	}
 	histItem.Params[0] = targetNick
 	channel.AddHistoryItem(histItem, details.account)
+
+	// Bridge notification for KICK
+	channel.server.onChannelKick(client, target, chname, comment)
 
 	channel.Quit(target)
 }

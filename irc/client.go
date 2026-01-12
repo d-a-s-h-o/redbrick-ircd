@@ -1422,6 +1422,8 @@ func (client *Client) destroy(session *Session) {
 			friends.Add(member)
 		}
 		channel.Quit(client)
+		// Bridge notification for QUIT (for each channel)
+		client.server.onChannelQuit(client, channel.Name())
 	}
 	friends.Remove(client)
 

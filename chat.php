@@ -56,6 +56,11 @@ route();
 function route()
 {
 	global $U, $db;
+	// IRC Bridge receiver endpoint
+	if (isset($_GET['bridge']) && $_GET['bridge'] === '1') {
+		handle_bridge_request();
+		exit; // Always exit after handling bridge request
+	}
 	if (!isset($_REQUEST['action'])) {
 		send_login();
 	} elseif ($_REQUEST['action'] === 'view') {
@@ -1361,6 +1366,41 @@ function send_setup($C)
 	/*****************************************
 	 *SETTINGS ONLY FOR SUPER ADMIN ARE ABOVE
 	 ******************************************/
+
+	// IRC Bridge Settings (Admin only)
+	if ($U['status'] >= 6) {
+		thr();
+		echo '<tr><td><table id="bridge"><tr><th colspan="2">IRC Bridge Settings</th></tr>';
+
+		// Bridge Enabled
+		$bridge_enabled = get_bridge_setting('enabled');
+		echo '<tr><td>Bridge Enabled:</td><td>';
+		echo '<select name="bridge_enabled">';
+		echo '<option value="0"' . ($bridge_enabled !== '1' ? ' selected' : '') . '>Disabled</option>';
+		echo '<option value="1"' . ($bridge_enabled === '1' ? ' selected' : '') . '>Enabled</option>';
+		echo '</select></td></tr>';
+
+		// IRC Endpoint
+		$irc_endpoint = get_bridge_setting('irc_endpoint') ?: 'http://irc.4-0-4.io:6666/bridge';
+		echo '<tr><td>IRC Endpoint:</td><td>';
+		echo '<input type="text" name="bridge_irc_endpoint" value="' . htmlspecialchars($irc_endpoint) . '" size="50">';
+		echo '</td></tr>';
+
+		// Auth Key
+		$auth_key = get_bridge_setting('auth_key') ?: '';
+		echo '<tr><td>Auth Key:</td><td>';
+		echo '<input type="password" name="bridge_auth_key" value="' . htmlspecialchars($auth_key) . '" size="50">';
+		echo '<br><small>Shared secret for HMAC authentication</small></td></tr>';
+
+		// Replay Window
+		$replay_window = get_bridge_setting('replay_window') ?: '300';
+		echo '<tr><td>Replay Window (seconds):</td><td>';
+		echo '<input type="number" name="bridge_replay_window" value="' . htmlspecialchars($replay_window) . '" min="60" max="600">';
+		echo '<br><small>Time window for replay protection (60-600 seconds)</small></td></tr>';
+
+		echo '</table></td></tr>';
+		thr();
+	}
 
 	echo '<tr><td>' . submit($I['apply']) . '</td></tr></table></form><br>';
 	if ($U['status'] == 8) {
@@ -5470,6 +5510,656 @@ function nav()
 	</ul> </nav>';
 }
 
+// ============================================================================
+// IRC BRIDGE FUNCTIONS
+// ============================================================================
+
+function handle_bridge_request()
+{
+	global $db;
+
+	// Check if bridge is enabled
+	$enabled = get_bridge_setting('enabled');
+	if ($enabled !== '1') {
+		http_response_code(503);
+		header('Content-Type: application/json');
+		echo json_encode(['error' => 'Bridge is not enabled']);
+		return;
+	}
+
+	// Read raw POST body
+	$json_body = file_get_contents('php://input');
+	if (empty($json_body)) {
+		http_response_code(400);
+		header('Content-Type: application/json');
+		echo json_encode(['error' => 'Empty request body']);
+		return;
+	}
+
+	// Parse JSON
+	$data = json_decode($json_body, true);
+	if ($data === null) {
+		http_response_code(400);
+		header('Content-Type: application/json');
+		echo json_encode(['error' => 'Invalid JSON']);
+		return;
+	}
+
+	// Verify required fields
+	if (!isset($data['event_type']) || !isset($data['timestamp']) || !isset($data['nonce']) || !isset($data['hmac'])) {
+		http_response_code(400);
+		header('Content-Type: application/json');
+		echo json_encode(['error' => 'Missing required fields']);
+		return;
+	}
+
+	// Verify HMAC signature
+	if (!verify_bridge_hmac($json_body, $data['hmac'])) {
+		http_response_code(401);
+		header('Content-Type: application/json');
+		echo json_encode(['error' => 'Invalid HMAC signature']);
+		log_bridge_audit($data['event_type'], $data['event_id'] ?? null, null, null, null, 'HMAC verification failed', 0);
+		return;
+	}
+
+	// Check replay protection
+	$replay_window = (int)get_bridge_setting('replay_window') ?: 300;
+	$timestamp_diff = abs(time() - $data['timestamp']);
+	if ($timestamp_diff > $replay_window) {
+		http_response_code(401);
+		header('Content-Type: application/json');
+		echo json_encode(['error' => 'Request expired']);
+		log_bridge_audit($data['event_type'], $data['event_id'] ?? null, null, null, null, "Timestamp too old: {$timestamp_diff}s", 0);
+		return;
+	}
+
+	// Check nonce for replay protection
+	if (!check_bridge_nonce($data['nonce'], $data['timestamp'])) {
+		http_response_code(401);
+		header('Content-Type: application/json');
+		echo json_encode(['error' => 'Duplicate nonce (replay attack)']);
+		log_bridge_audit($data['event_type'], $data['event_id'] ?? null, null, null, null, 'Nonce already used', 0);
+		return;
+	}
+
+	// Dispatch to event handler
+	$event_type = $data['event_type'];
+	$result = null;
+
+	try {
+		switch ($event_type) {
+			case 'user_join':
+				$result = handle_bridge_user_join($data);
+				break;
+			case 'user_leave':
+				$result = handle_bridge_user_leave($data);
+				break;
+			case 'message':
+				$result = handle_bridge_message($data);
+				break;
+			case 'action':
+				$result = handle_bridge_action($data);
+				break;
+			case 'private_message':
+				$result = handle_bridge_private_message($data);
+				break;
+			case 'kick':
+				$result = handle_bridge_kick($data);
+				break;
+			case 'ban':
+				$result = handle_bridge_ban($data);
+				break;
+			case 'link_complete':
+				$result = handle_bridge_link_complete($data);
+				break;
+			default:
+				http_response_code(400);
+				header('Content-Type: application/json');
+				echo json_encode(['error' => 'Unknown event type']);
+				return;
+		}
+
+		http_response_code(200);
+		header('Content-Type: application/json');
+		echo json_encode(['success' => true, 'result' => $result]);
+
+	} catch (Exception $e) {
+		error_log("Bridge handler error: " . $e->getMessage());
+		http_response_code(500);
+		header('Content-Type: application/json');
+		echo json_encode(['error' => 'Internal error', 'message' => $e->getMessage()]);
+		log_bridge_audit($event_type, $data['event_id'] ?? null, null, null, null, "Error: " . $e->getMessage(), 0);
+	}
+}
+
+function verify_bridge_hmac($json_body, $provided_hmac)
+{
+	$auth_key = get_bridge_setting('auth_key');
+	if (empty($auth_key)) {
+		error_log("Bridge auth_key not configured");
+		return false;
+	}
+
+	// Remove the HMAC field from the JSON for verification
+	$data = json_decode($json_body, true);
+	unset($data['hmac']);
+	$payload_without_hmac = json_encode($data, JSON_UNESCAPED_SLASHES);
+
+	$computed_hmac = hash_hmac('sha256', $payload_without_hmac, $auth_key);
+	return hash_equals($computed_hmac, $provided_hmac);
+}
+
+function check_bridge_nonce($nonce, $timestamp)
+{
+	global $db;
+
+	// Create nonce tracking table if it doesn't exist
+	try {
+		if (DBDRIVER === 0) { // MySQL
+			$db->exec('CREATE TABLE IF NOT EXISTS ' . PREFIX . 'bridge_nonces (
+				nonce varchar(100) PRIMARY KEY,
+				timestamp integer NOT NULL,
+				INDEX(timestamp)
+			) ENGINE=MEMORY DEFAULT CHARSET=utf8mb4;');
+		} else {
+			$db->exec('CREATE TABLE IF NOT EXISTS ' . PREFIX . 'bridge_nonces (
+				nonce varchar(100) PRIMARY KEY,
+				timestamp integer NOT NULL
+			);');
+		}
+	} catch (Exception $e) {
+		error_log("Failed to create bridge_nonces table: " . $e->getMessage());
+	}
+
+	// Check if nonce already exists
+	$stmt = $db->prepare('SELECT 1 FROM ' . PREFIX . 'bridge_nonces WHERE nonce = ?');
+	$stmt->execute([$nonce]);
+	if ($stmt->fetch()) {
+		return false; // Nonce already used
+	}
+
+	// Store the nonce
+	$stmt = $db->prepare('INSERT INTO ' . PREFIX . 'bridge_nonces (nonce, timestamp) VALUES (?, ?)');
+	$stmt->execute([$nonce, $timestamp]);
+
+	// Cleanup old nonces periodically
+	$last_cleanup = (int)get_bridge_setting('last_nonce_cleanup');
+	if (time() - $last_cleanup > 3600) { // Cleanup every hour
+		$replay_window = (int)get_bridge_setting('replay_window') ?: 300;
+		$cutoff = time() - ($replay_window * 2);
+		$db->exec('DELETE FROM ' . PREFIX . "bridge_nonces WHERE timestamp < $cutoff");
+		set_bridge_setting('last_nonce_cleanup', (string)time());
+	}
+
+	return true;
+}
+
+function handle_bridge_user_join($data)
+{
+	global $db;
+
+	$irc_nick = $data['irc_nick'] ?? null;
+	$destination = $data['destination'] ?? null;
+
+	if (empty($irc_nick) || empty($destination)) {
+		throw new Exception('Missing irc_nick or destination');
+	}
+
+	// Create virtual PHP user with irc_ prefix
+	$php_nick = 'irc_' . $irc_nick;
+
+	// Check if destination is mapped
+	$mapping = get_bridge_mapping($destination);
+	if (!$mapping) {
+		// Not mapped, silently ignore
+		return ['status' => 'ignored', 'reason' => 'destination not mapped'];
+	}
+
+	// Check if user already has a session
+	$stmt = $db->prepare('SELECT sessionid FROM ' . PREFIX . 'sessions WHERE nickname = ?');
+	$stmt->execute([$php_nick]);
+	if ($stmt->fetch()) {
+		// Already in chat
+		return ['status' => 'already_present'];
+	}
+
+	// Create a virtual session for this IRC user
+	create_bridge_session($php_nick, $destination);
+
+	// Send system message about join
+	$room_id = get_room_id_for_destination($destination);
+	send_system_message_to_room("$php_nick has joined from IRC", $room_id, 1);
+
+	log_bridge_audit('user_join', $data['event_id'] ?? null, $php_nick, $irc_nick, $destination, null, 1);
+
+	return ['status' => 'ok', 'php_nick' => $php_nick];
+}
+
+function handle_bridge_user_leave($data)
+{
+	global $db;
+
+	$irc_nick = $data['irc_nick'] ?? null;
+	$destination = $data['destination'] ?? null;
+
+	if (empty($irc_nick)) {
+		throw new Exception('Missing irc_nick');
+	}
+
+	$php_nick = 'irc_' . $irc_nick;
+
+	// Remove session
+	$stmt = $db->prepare('DELETE FROM ' . PREFIX . 'sessions WHERE nickname = ?');
+	$stmt->execute([$php_nick]);
+
+	// Send system message about leave (if destination is mapped)
+	if (!empty($destination)) {
+		$mapping = get_bridge_mapping($destination);
+		if ($mapping) {
+			$room_id = get_room_id_for_destination($destination);
+			send_system_message_to_room("$php_nick has left to IRC", $room_id, 1);
+		}
+	}
+
+	log_bridge_audit('user_leave', $data['event_id'] ?? null, $php_nick, $irc_nick, $destination, null, 1);
+
+	return ['status' => 'ok'];
+}
+
+function handle_bridge_message($data)
+{
+	global $db;
+
+	$irc_nick = $data['irc_nick'] ?? null;
+	$message = $data['message'] ?? null;
+	$destination = $data['destination'] ?? null;
+
+	if (empty($irc_nick) || !isset($message) || empty($destination)) {
+		throw new Exception('Missing required fields');
+	}
+
+	// Check if destination is mapped
+	$mapping = get_bridge_mapping($destination);
+	if (!$mapping) {
+		return ['status' => 'ignored', 'reason' => 'destination not mapped'];
+	}
+
+	$php_nick = 'irc_' . $irc_nick;
+
+	// Ensure session exists
+	ensure_bridge_session($php_nick, $destination);
+
+	// Insert message into PHP chat
+	$room_id = get_room_id_for_destination($destination);
+	insert_chat_message($php_nick, $message, $room_id, 10); // status 10 = IRC bridge user
+
+	log_bridge_audit('message', $data['event_id'] ?? null, $php_nick, $irc_nick, $destination, mb_substr($message, 0, 100), 1);
+
+	return ['status' => 'ok'];
+}
+
+function handle_bridge_action($data)
+{
+	global $db;
+
+	$irc_nick = $data['irc_nick'] ?? null;
+	$action_text = $data['action'] ?? null;
+	$destination = $data['destination'] ?? null;
+
+	if (empty($irc_nick) || !isset($action_text) || empty($destination)) {
+		throw new Exception('Missing required fields');
+	}
+
+	// Check if destination is mapped
+	$mapping = get_bridge_mapping($destination);
+	if (!$mapping) {
+		return ['status' => 'ignored', 'reason' => 'destination not mapped'];
+	}
+
+	$php_nick = 'irc_' . $irc_nick;
+
+	// Ensure session exists
+	ensure_bridge_session($php_nick, $destination);
+
+	// Format as /me action in PHP
+	$message = "<em>* $php_nick $action_text</em>";
+
+	// Insert message into PHP chat
+	$room_id = get_room_id_for_destination($destination);
+	insert_chat_message($php_nick, $message, $room_id, 10);
+
+	log_bridge_audit('action', $data['event_id'] ?? null, $php_nick, $irc_nick, $destination, mb_substr($action_text, 0, 100), 1);
+
+	return ['status' => 'ok'];
+}
+
+function handle_bridge_private_message($data)
+{
+	// PMs not yet implemented - would need to map IRC nicks to PHP users
+	return ['status' => 'not_implemented'];
+}
+
+function handle_bridge_kick($data)
+{
+	global $db;
+
+	$irc_nick = $data['irc_nick'] ?? null;
+	$target_nick = $data['target_nick'] ?? null;
+	$reason = $data['reason'] ?? '';
+	$destination = $data['destination'] ?? null;
+
+	if (empty($irc_nick) || empty($target_nick) || empty($destination)) {
+		throw new Exception('Missing required fields');
+	}
+
+	// Check if destination is mapped
+	$mapping = get_bridge_mapping($destination);
+	if (!$mapping) {
+		return ['status' => 'ignored', 'reason' => 'destination not mapped'];
+	}
+
+	// Check if target is a PHP user (web_ prefix)
+	if (strpos($target_nick, 'web_') !== 0) {
+		// Target is an IRC user, ignore (handled on IRC side)
+		return ['status' => 'ignored', 'reason' => 'target is IRC user'];
+	}
+
+	// Extract PHP nickname (remove web_ prefix)
+	$php_target = substr($target_nick, 4);
+
+	// Perform kick in PHP chat
+	$stmt = $db->prepare('DELETE FROM ' . PREFIX . 'sessions WHERE nickname = ?');
+	$stmt->execute([$php_target]);
+
+	// Add kick timeout
+	$stmt = $db->prepare('SELECT id FROM ' . PREFIX . 'members WHERE nickname = ?');
+	$stmt->execute([$php_target]);
+	$member = $stmt->fetch(PDO::FETCH_ASSOC);
+	if ($member) {
+		$timeout = time() + (int)get_setting('kickpenalty') * 60;
+		$stmt = $db->prepare('UPDATE ' . PREFIX . 'members SET kicked = ? WHERE id = ?');
+		$stmt->execute([$timeout, $member['id']]);
+	}
+
+	// Send system message
+	$room_id = get_room_id_for_destination($destination);
+	send_system_message_to_room("$php_target was kicked by irc_$irc_nick" . ($reason ? ": $reason" : ""), $room_id, 5);
+
+	log_bridge_audit('kick', $data['event_id'] ?? null, 'irc_' . $irc_nick, $irc_nick, $destination, "Kicked $php_target: $reason", 1);
+
+	return ['status' => 'ok'];
+}
+
+function handle_bridge_ban($data)
+{
+	global $db;
+
+	$irc_nick = $data['irc_nick'] ?? null;
+	$ban_mask = $data['ban_mask'] ?? null;
+	$is_ban = $data['is_ban'] ?? true;
+	$destination = $data['destination'] ?? null;
+
+	if (empty($irc_nick) || empty($ban_mask) || empty($destination)) {
+		throw new Exception('Missing required fields');
+	}
+
+	// Check if destination is mapped
+	$mapping = get_bridge_mapping($destination);
+	if (!$mapping) {
+		return ['status' => 'ignored', 'reason' => 'destination not mapped'];
+	}
+
+	// Ban handling in PHP would need IP tracking - not fully implemented
+	// Just log for now
+	$action = $is_ban ? 'banned' : 'unbanned';
+	$room_id = get_room_id_for_destination($destination);
+	send_system_message_to_room("irc_$irc_nick $action $ban_mask", $room_id, 5);
+
+	log_bridge_audit($is_ban ? 'ban' : 'unban', $data['event_id'] ?? null, 'irc_' . $irc_nick, $irc_nick, $destination, $ban_mask, 1);
+
+	return ['status' => 'ok'];
+}
+
+function handle_bridge_link_complete($data)
+{
+	global $db;
+
+	$php_user_id = $data['php_user_id'] ?? null;
+	$irc_account = $data['irc_account'] ?? null;
+	$success = $data['success'] ?? false;
+
+	if (empty($php_user_id) || empty($irc_account)) {
+		throw new Exception('Missing required fields');
+	}
+
+	if ($success) {
+		// Update or insert account link
+		$stmt = $db->prepare('INSERT INTO ' . PREFIX . 'account_links (php_user_id, irc_account, created_at, verified_at)
+			VALUES (?, ?, ?, ?)
+			ON DUPLICATE KEY UPDATE irc_account = ?, verified_at = ?');
+		$now = time();
+		$stmt->execute([$php_user_id, $irc_account, $now, $now, $irc_account, $now]);
+
+		log_bridge_audit('link_complete', $data['event_id'] ?? null, (string)$php_user_id, $irc_account, null, 'Account linked successfully', 1);
+	} else {
+		log_bridge_audit('link_complete', $data['event_id'] ?? null, (string)$php_user_id, $irc_account, null, 'Account linking failed', 0);
+	}
+
+	return ['status' => 'ok'];
+}
+
+// Bridge helper functions
+
+function get_bridge_setting($setting)
+{
+	global $db;
+	$stmt = $db->prepare('SELECT value FROM ' . PREFIX . 'bridge_settings WHERE setting = ?');
+	$stmt->execute([$setting]);
+	$result = $stmt->fetch(PDO::FETCH_ASSOC);
+	return $result ? $result['value'] : null;
+}
+
+function set_bridge_setting($setting, $value)
+{
+	global $db;
+	$stmt = $db->prepare('INSERT INTO ' . PREFIX . 'bridge_settings (setting, value) VALUES (?, ?) ON DUPLICATE KEY UPDATE value = ?');
+	$stmt->execute([$setting, $value, $value]);
+}
+
+function get_bridge_mapping($destination_key)
+{
+	global $db;
+	$stmt = $db->prepare('SELECT irc_channel FROM ' . PREFIX . 'bridge_mappings WHERE destination_key = ?');
+	$stmt->execute([$destination_key]);
+	$result = $stmt->fetch(PDO::FETCH_ASSOC);
+	return $result ? $result['irc_channel'] : null;
+}
+
+function get_room_id_for_destination($destination)
+{
+	global $db;
+
+	// "room" means main room (null/0)
+	if ($destination === 'room') {
+		return null;
+	}
+
+	// "s XX" means status channel - map to room ID
+	// For now, return null (main room) - proper room mapping would need more logic
+	return null;
+}
+
+function create_bridge_session($php_nick, $destination)
+{
+	global $db;
+
+	$room_id = get_room_id_for_destination($destination);
+
+	// Create session for IRC user
+	$session_id = bin2hex(random_bytes(16));
+	$stmt = $db->prepare('INSERT INTO ' . PREFIX . 'sessions
+		(sessionid, nickname, status, lastpost, style, roomid)
+		VALUES (?, ?, 10, ?, \'\', ?)');
+	$stmt->execute([$session_id, $php_nick, time(), $room_id]);
+}
+
+function ensure_bridge_session($php_nick, $destination)
+{
+	global $db;
+
+	// Check if session exists
+	$stmt = $db->prepare('SELECT sessionid FROM ' . PREFIX . 'sessions WHERE nickname = ?');
+	$stmt->execute([$php_nick]);
+	if (!$stmt->fetch()) {
+		// Create session
+		create_bridge_session($php_nick, $destination);
+	} else {
+		// Update lastpost time
+		$stmt = $db->prepare('UPDATE ' . PREFIX . 'sessions SET lastpost = ? WHERE nickname = ?');
+		$stmt->execute([time(), $php_nick]);
+	}
+}
+
+function insert_chat_message($nickname, $message, $room_id, $status)
+{
+	global $db;
+
+	$stmt = $db->prepare('INSERT INTO ' . PREFIX . 'messages
+		(postid, postdate, poster, poststatus, text, roomid, allrooms, deleted)
+		VALUES (NULL, ?, ?, ?, ?, ?, 0, 0)');
+
+	$text = $message;
+	if (MSGENCRYPTED) {
+		$text = base64_encode(sodium_crypto_aead_aes256gcm_encrypt($message, '', AES_IV, ENCRYPTKEY));
+	}
+
+	$stmt->execute([time(), $nickname, $status, $text, $room_id]);
+}
+
+function send_system_message_to_room($message, $room_id, $min_status)
+{
+	insert_chat_message('[System]', $message, $room_id, $min_status);
+}
+
+function log_bridge_audit($event_type, $event_id, $php_user, $irc_user, $destination, $details, $success)
+{
+	global $db;
+
+	try {
+		$stmt = $db->prepare('INSERT INTO ' . PREFIX . 'bridge_audit
+			(timestamp, event_type, event_id, php_user, irc_user, destination, details, success)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?)');
+		$stmt->execute([time(), $event_type, $event_id, $php_user, $irc_user, $destination, $details, $success ? 1 : 0]);
+	} catch (Exception $e) {
+		error_log("Failed to log bridge audit: " . $e->getMessage());
+	}
+}
+
+// Outbound: Send PHP events to IRC
+function notify_irc_event($event_type, $data)
+{
+	global $db;
+
+	// Check if bridge is enabled
+	$enabled = get_bridge_setting('enabled');
+	if ($enabled !== '1') {
+		return; // Silently return if bridge disabled
+	}
+
+	$irc_endpoint = get_bridge_setting('irc_endpoint');
+	$auth_key = get_bridge_setting('auth_key');
+
+	if (empty($irc_endpoint) || empty($auth_key)) {
+		error_log("Bridge not configured: missing endpoint or auth_key");
+		return;
+	}
+
+	// Build payload
+	$payload = [
+		'event_type' => $event_type,
+		'timestamp' => time(),
+		'nonce' => bin2hex(random_bytes(16)),
+		'event_id' => bin2hex(random_bytes(8)),
+	];
+	$payload = array_merge($payload, $data);
+
+	// Compute HMAC
+	$payload_json = json_encode($payload, JSON_UNESCAPED_SLASHES);
+	$hmac = hash_hmac('sha256', $payload_json, $auth_key);
+	$payload['hmac'] = $hmac;
+
+	// Send to IRC endpoint asynchronously (fire and forget)
+	$final_json = json_encode($payload, JSON_UNESCAPED_SLASHES);
+
+	// Use fsockopen for async non-blocking request
+	$url_parts = parse_url($irc_endpoint);
+	$host = $url_parts['host'] ?? 'localhost';
+	$port = $url_parts['port'] ?? 6666;
+	$path = $url_parts['path'] ?? '/bridge';
+
+	$fp = @fsockopen($host, $port, $errno, $errstr, 1);
+	if ($fp) {
+		stream_set_blocking($fp, false);
+		$request = "POST $path HTTP/1.1\r\n";
+		$request .= "Host: $host\r\n";
+		$request .= "Content-Type: application/json\r\n";
+		$request .= "Content-Length: " . strlen($final_json) . "\r\n";
+		$request .= "Connection: close\r\n\r\n";
+		$request .= $final_json;
+		fwrite($fp, $request);
+		fclose($fp);
+	} else {
+		error_log("Failed to connect to IRC bridge: $errstr ($errno)");
+	}
+}
+
+function notify_irc_user_join($php_nick, $destination)
+{
+	notify_irc_event('user_join', [
+		'php_nick' => $php_nick,
+		'destination' => $destination,
+	]);
+}
+
+function notify_irc_user_leave($php_nick, $destination)
+{
+	notify_irc_event('user_leave', [
+		'php_nick' => $php_nick,
+		'destination' => $destination,
+	]);
+}
+
+function notify_irc_message($php_nick, $message, $destination, $is_action = false)
+{
+	if ($is_action) {
+		notify_irc_event('action', [
+			'php_nick' => $php_nick,
+			'action' => $message,
+			'destination' => $destination,
+		]);
+	} else {
+		notify_irc_event('message', [
+			'php_nick' => $php_nick,
+			'message' => $message,
+			'destination' => $destination,
+		]);
+	}
+}
+
+function notify_irc_kick($moderator_nick, $target_nick, $reason, $destination)
+{
+	notify_irc_event('kick', [
+		'php_nick' => $moderator_nick,
+		'target_nick' => $target_nick,
+		'reason' => $reason,
+		'destination' => $destination,
+	]);
+}
+
+// ============================================================================
+// END IRC BRIDGE FUNCTIONS
+// ============================================================================
+
 function send_login()
 {
 	global $I;
@@ -5947,6 +6637,10 @@ function write_new_session($password)
 		if (($U['status'] >= 3 && $U['status'] <= 6 && !$U['incognito']) || ($U['status'] >= 7 && !$U['incognito'] && (bool) get_setting('adminjoinleavemsg'))) {
 			add_system_message(sprintf(get_setting('msgenter'), style_this_clickable(htmlspecialchars($U['nickname']), $U['style'])));
 		}
+
+		// Notify IRC bridge of user join
+		$destination = isset($U['roomid']) && $U['roomid'] ? 's ' . $U['roomid'] : 'room';
+		notify_irc_user_join($U['nickname'], $destination);
 	}
 }
 
@@ -6037,6 +6731,10 @@ function kill_session()
 		//MODIFICATION for clickablenicknames stlye_this_clickable instead of style_this
 		add_system_message(sprintf(get_setting('msgexit'), style_this_clickable(htmlspecialchars($U['nickname']), $U['style'])));
 	}
+
+	// Notify IRC bridge of user leave
+	$destination = isset($U['roomid']) && $U['roomid'] ? 's ' . $U['roomid'] : 'room';
+	notify_irc_user_leave($U['nickname'], $destination);
 }
 
 function kick_chatter($names, $mes, $purge)
@@ -6069,6 +6767,11 @@ function kick_chatter($names, $mes, $purge)
 			
 			// Send PM notification
 			send_bot_pm($name, "⛔ <strong>You have been kicked</strong><br><strong>By:</strong> " . htmlspecialchars($U['nickname']) . "<br><strong>Reason:</strong> " . htmlspecialchars($mes ?: 'No reason provided') . "<br><strong>Duration:</strong> " . get_setting('kickpenalty') . " minutes");
+
+			// Notify IRC bridge of kick
+			$destination = 'room'; // TODO: get actual room/destination from session
+			notify_irc_kick($U['nickname'], $name, $mes ?: 'No reason provided', $destination);
+
 			//MODIFICATION style_thins replaced with style_this_clickable
 			$lonick .= style_this_clickable(htmlspecialchars($name), $temp['style']) . ', ';
 			++$i;
@@ -7573,7 +8276,22 @@ function write_message($message)
 		error_log("[WRITE_MSG DEBUG ERROR] INSERT failed: " . $e->getMessage());
 		throw $e;
 	}
-	
+
+	// Notify IRC bridge of message (only for regular chat messages, not system messages or PMs)
+	if (!empty($message['poster']) && $message['delstatus'] != 4 && $message['poststatus'] != 9 && empty($message['recipient'])) {
+		$destination = isset($message['roomid']) && $message['roomid'] ? 's ' . $message['roomid'] : 'room';
+		// Check if message is a /me action (contains <em>* )
+		$is_action = (strpos($message['text'], '<em>* ') === 0);
+		if ($is_action) {
+			// Extract action text from "<em>* nickname action_text</em>"
+			$action_text = strip_tags($message['text']);
+			$action_text = preg_replace('/^\* ' . preg_quote($message['poster'], '/') . ' /', '', $action_text);
+			notify_irc_message($message['poster'], $action_text, $destination, true);
+		} else {
+			notify_irc_message($message['poster'], strip_tags($message['text']), $destination, false);
+		}
+	}
+
 	if ($message['poststatus'] < 9 && get_setting('sendmail')) {
 		$subject = 'New Chat message';
 		$headers = 'From: ' . get_setting('mailsender') . "\r\nX-Mailer: PHP/" . phpversion() . "\r\nContent-Type: text/html; charset=UTF-8\r\n";
@@ -8380,6 +9098,23 @@ function save_setup($C)
 			update_setting($setting, $_REQUEST[$setting]);
 		}
 	}
+
+	// Save bridge settings
+	if (isset($_REQUEST['bridge_enabled'])) {
+		set_bridge_setting('enabled', $_REQUEST['bridge_enabled']);
+	}
+	if (isset($_REQUEST['bridge_irc_endpoint'])) {
+		set_bridge_setting('irc_endpoint', $_REQUEST['bridge_irc_endpoint']);
+	}
+	if (isset($_REQUEST['bridge_auth_key']) && !empty($_REQUEST['bridge_auth_key'])) {
+		set_bridge_setting('auth_key', $_REQUEST['bridge_auth_key']);
+	}
+	if (isset($_REQUEST['bridge_replay_window'])) {
+		$window = (int)$_REQUEST['bridge_replay_window'];
+		if ($window >= 60 && $window <= 600) {
+			set_bridge_setting('replay_window', (string)$window);
+		}
+	}
 }
 
 function set_default_tz()
@@ -8414,6 +9149,11 @@ function valid_nick($nick)
 {
 	$len = mb_strlen($nick);
 	if ($len < 1 || $len > get_setting('maxname')) {
+		return false;
+	}
+	// Reject IRC bridge reserved prefixes
+	$nick_lower = strtolower($nick);
+	if (strpos($nick_lower, 'irc_') === 0 || strpos($nick_lower, 'web_') === 0) {
 		return false;
 	}
 	return preg_match('/' . get_setting('nickregex') . '/u', $nick);
@@ -9765,7 +10505,68 @@ function update_db()
 			// Column might already exist
 		}
 	}
-	
+
+	// IRC Bridge integration
+	if ($dbversion < 2118) {
+		try {
+			// Bridge settings table
+			$db->exec('CREATE TABLE IF NOT EXISTS ' . PREFIX . "bridge_settings (
+				setting varchar(255) NOT NULL PRIMARY KEY,
+				value text NOT NULL
+			)$diskengine$charset;");
+
+			// Bridge mappings table (room/destination <-> IRC channel)
+			$db->exec('CREATE TABLE IF NOT EXISTS ' . PREFIX . "bridge_mappings (
+				destination_key varchar(50) NOT NULL PRIMARY KEY,
+				irc_channel varchar(100) NOT NULL,
+				updated_at integer NOT NULL,
+				updated_by varchar(50) NOT NULL
+			)$diskengine$charset;");
+
+			// Account linking table
+			$db->exec('CREATE TABLE IF NOT EXISTS ' . PREFIX . "account_links (
+				php_user_id integer NOT NULL PRIMARY KEY,
+				irc_account varchar(100) NOT NULL,
+				created_at integer NOT NULL,
+				verified_at integer NOT NULL
+			)$diskengine$charset;");
+			$db->exec('CREATE INDEX IF NOT EXISTS ' . PREFIX . 'account_links_irc ON ' . PREFIX . 'account_links(irc_account);');
+
+			// Bridge audit log table
+			$db->exec('CREATE TABLE IF NOT EXISTS ' . PREFIX . "bridge_audit (
+				id $primary,
+				timestamp integer NOT NULL,
+				event_type varchar(50) NOT NULL,
+				event_id varchar(100),
+				php_user varchar(50),
+				irc_user varchar(100),
+				destination varchar(50),
+				details text,
+				success smallint NOT NULL DEFAULT 1
+			)$diskengine$charset;");
+			$db->exec('CREATE INDEX IF NOT EXISTS ' . PREFIX . 'bridge_audit_time ON ' . PREFIX . 'bridge_audit(timestamp);');
+			$db->exec('CREATE INDEX IF NOT EXISTS ' . PREFIX . 'bridge_audit_event_id ON ' . PREFIX . 'bridge_audit(event_id);');
+
+			// Insert default bridge settings
+			$db->exec('INSERT IGNORE INTO ' . PREFIX . "bridge_settings (setting, value) VALUES
+				('enabled', '0'),
+				('irc_endpoint', 'http://irc.4-0-4.io:6666/bridge'),
+				('auth_key', ''),
+				('replay_window', '300'),
+				('last_nonce_cleanup', '0');");
+
+			// Insert default mappings (matching Ergo default.yaml)
+			$db->exec('INSERT IGNORE INTO ' . PREFIX . "bridge_mappings (destination_key, irc_channel, updated_at, updated_by) VALUES
+				('room', '#main', " . time() . ", 'system'),
+				('s 31', '#members', " . time() . ", 'system'),
+				('s 48', '#staff', " . time() . ", 'system'),
+				('s 58', '#admin', " . time() . ", 'system');");
+
+		} catch (Exception $e) {
+			error_log("Bridge migration 2118 failed: " . $e->getMessage());
+		}
+	}
+
 	update_setting('dbversion', DBVERSION);
 	if ($msgencrypted !== MSGENCRYPTED) {
 		if (!extension_loaded('sodium')) {
@@ -10390,7 +11191,7 @@ function load_config()
 	define('VERSION', '2.2.2'); // Script version
 	//See changelog
 
-	define('DBVERSION', 2117); // Database layout version (User history severity)
+	define('DBVERSION', 2118); // Database layout version (IRC Bridge integration)
 	//Paste other config below this line: 
 	define('MSGENCRYPTED', false); // Store messages encrypted in the database to prevent other database users from reading them - true/false - visit the setup page after editing!
 	define('ENCRYPTKEY_PASS', 'MY_SECRET_KEY'); // Recommended length: 32. Encryption key for messages
@@ -10412,12 +11213,6 @@ function load_config()
 	}
 	define('COOKIENAME', PREFIX . 'chat_session'); // Cookie name storing the session information
 	define('LANG', 'en'); // Default language
-
-	// Bridge configuration for IRC integration
-	define('BRIDGE_ENABLED', false); // Enable/disable IRC bridge integration
-	define('BRIDGE_HOST', '127.0.0.1'); // IRC bridge host (should be localhost)
-	define('BRIDGE_PORT', 6666); // IRC bridge port
-	define('BRIDGE_AUTH_KEY', ''); // Shared secret key for bridge authentication (must match IRC config)
 
 	if (MSGENCRYPTED) {
 		if (version_compare(PHP_VERSION, '7.2.0') < 0) {

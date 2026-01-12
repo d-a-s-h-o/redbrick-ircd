@@ -1171,6 +1171,53 @@ func nsUnregisterHandler(service *ircService, server *Server, client *Client, co
 	}
 }
 
+func nsLinkHandler(service *ircService, server *Server, client *Client, command string, params []string, rb *ResponseBuffer) {
+	if server.bridge == nil || !server.bridge.IsEnabled() {
+		service.Notice(rb, client.t("Bridge is not enabled"))
+		return
+	}
+
+	// Get the token from params
+	token := params[0]
+	if token == "" {
+		service.Notice(rb, client.t("You must provide a link token"))
+		return
+	}
+
+	// Get client's authenticated account
+	account := client.Account()
+	if account == "" {
+		service.Notice(rb, client.t("You must be logged in to link your account"))
+		return
+	}
+
+	// Validate the token
+	linkToken, err := server.bridge.ValidateLinkToken(token, account)
+	if err != nil {
+		service.Notice(rb, fmt.Sprintf(client.t("Link failed: %s"), err.Error()))
+		server.logger.Info("bridge", "Link validation failed for", account, ":", err.Error())
+		return
+	}
+
+	// Complete the linking
+	err = server.bridge.CompleteLinking(linkToken.PHPUserID, account)
+	if err != nil {
+		service.Notice(rb, fmt.Sprintf(client.t("Failed to complete link: %s"), err.Error()))
+		server.logger.Error("bridge", "Failed to complete linking for", account, ":", err.Error())
+		return
+	}
+
+	// Mark token as completed
+	server.bridge.linkingManager.CompleteLink(token, true)
+
+	// TODO: Send notification to PHP (implement in outbound HTTP POST task)
+	server.bridge.NotifyLinkComplete(linkToken.PHPUserID, account, true)
+
+	// Success message
+	service.Notice(rb, client.t("Your IRC account has been successfully linked to your PHP chat account!"))
+	server.logger.Info("bridge", "Account link completed: PHP user", linkToken.PHPUserID, "→ IRC account", account)
+}
+
 func nsVerifyHandler(service *ircService, server *Server, client *Client, command string, params []string, rb *ResponseBuffer) {
 	username, code := params[0], params[1]
 	err := server.accounts.Verify(client, username, code, false)

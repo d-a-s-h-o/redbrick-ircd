@@ -5,7 +5,6 @@ package irc
 
 import (
 	"bufio"
-	"encoding/json"
 	"fmt"
 	"net"
 	"strings"
@@ -24,7 +23,6 @@ type BridgeListener struct {
 	listener      net.Listener
 	shutdown      atomic.Bool
 	activeConns   atomic.Int32
-	rateLimiter   *utils.GenericThrottle
 	wg            sync.WaitGroup
 }
 
@@ -44,11 +42,6 @@ func NewBridgeListener(server *Server, bridge *BridgeManager, config *BridgeConf
 		bridge:   bridge,
 		config:   config,
 		listener: listener,
-	}
-
-	// Initialize rate limiter if configured
-	if config.RequestRateLimit > 0 {
-		bl.rateLimiter = utils.NewGenericThrottle(time.Minute, config.RequestRateLimit)
 	}
 
 	// Start accepting connections
@@ -169,13 +162,6 @@ func (bl *BridgeListener) handleConnection(conn net.Conn) {
 		session.lastActivity = time.Now()
 		conn.SetDeadline(time.Now().Add(30 * time.Second))
 
-		// Rate limiting
-		if bl.rateLimiter != nil && !bl.rateLimiter.Try() {
-			bl.sendError(conn, "Rate limit exceeded", "RATE_LIMIT")
-			bl.server.logger.Warning("bridge", "Rate limit exceeded for", remoteAddr)
-			return
-		}
-
 		// Process request
 		response := bl.handleRequest(session, line)
 		if response != nil {
@@ -282,7 +268,7 @@ func (bl *BridgeListener) handlePHPUserJoin(req *BridgeRequest) *BridgeResponse 
 		return NewBridgeError(err.Error(), "CREATE_FAILED")
 	}
 
-	bl.server.logger.Debug("bridge", "PHP user joined:", payload.Nickname, "status", payload.Status)
+	bl.server.logger.Debug("bridge", "PHP user joined:", payload.Nickname, "status", fmt.Sprintf("%d", payload.Status))
 
 	return NewBridgeResponse(MsgTypeAuthOK, map[string]interface{}{
 		"success": true,

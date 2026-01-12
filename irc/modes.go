@@ -228,6 +228,10 @@ func (channel *Channel) ApplyChannelModeChanges(client *Client, isSamode bool, c
 					appliedChange := change
 					appliedChange.Arg = maskAdded
 					applied = append(applied, appliedChange)
+					// Bridge notification for ban add
+					if change.Mode == modes.BanMask {
+						channel.server.onChannelBan(client, chname, maskAdded, true)
+					}
 				} else if err != nil {
 					rb.Add(nil, client.server.name, ERR_INVALIDMODEPARAM, details.nick, chname, string(change.Mode), utils.SafeErrorParam(mask), fmt.Sprintf(client.t("Invalid mode %[1]s parameter: %[2]s"), string(change.Mode), mask))
 				} else {
@@ -240,6 +244,10 @@ func (channel *Channel) ApplyChannelModeChanges(client *Client, isSamode bool, c
 					appliedChange := change
 					appliedChange.Arg = maskRemoved
 					applied = append(applied, appliedChange)
+					// Bridge notification for ban remove
+					if change.Mode == modes.BanMask {
+						channel.server.onChannelBan(client, chname, maskRemoved, false)
+					}
 				} else if err != nil {
 					rb.Add(nil, client.server.name, ERR_INVALIDMODEPARAM, details.nick, chname, string(change.Mode), utils.SafeErrorParam(mask), fmt.Sprintf(client.t("Invalid mode %[1]s parameter: %[2]s"), string(change.Mode), mask))
 				} else {

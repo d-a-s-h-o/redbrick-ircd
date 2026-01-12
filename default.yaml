@@ -1191,7 +1191,7 @@ bridge:
     # Shared secret key for HMAC-SHA256 authentication. REQUIRED if bridge is enabled.
     # Generate a strong random key with at least 32 characters:
     # python3 -c "import secrets; print(secrets.token_urlsafe(32))"
-    # This key must be shared with the external application.
+    # This key must be shared with the external application (PHP chat).
     auth-key: ""
 
     # Optional IP allowlist for bridge connections. Only IPs in this list can connect.
@@ -1199,6 +1199,23 @@ bridge:
     allowed-ips:
         - "127.0.0.1"
         - "::1"
+
+    # Maximum number of concurrent bridge connections
+    connection-limit: 10
+
+    # Request rate limit (requests per minute). 0 = no limit
+    request-rate-limit: 0
+
+    # Link token expiry duration (how long account linking tokens remain valid)
+    link-token-expiry: 15m
+
+    # Default channel/room mappings (PHP sendto → IRC channel)
+    # These can be updated dynamically via the bridge protocol
+    default-mappings:
+        "room": "#main"
+        "s 31": "#members"
+        "s 48": "#staff"
+        "s 58": "#admin"
 
     # Maximum number of concurrent bridge connections allowed.
     connection-limit: 10
